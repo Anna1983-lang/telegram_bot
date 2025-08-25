@@ -18,11 +18,13 @@ from openpyxl.utils import get_column_letter
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# ---------- Настройки ----------
+# ---------- Настройки (ENV) ----------
 TOKEN = os.environ.get("TELEGRAM_TOKEN", "8475192387:AAESFlpUUqJzlqPTQkcAv1sDVeZJSFOQV0w")
 ADMIN_ID = int(os.environ.get("ADMIN_ID", "1227847495"))
 
-WEBHOOK_URL = os.environ.get("WEBHOOK_URL")  # обязателен
+# Обязателен на Render, пример:
+# https://telegram-bot-aum2.onrender.com/webhook/8475192387
+WEBHOOK_URL = os.environ.get("WEBHOOK_URL")
 BOT_ID_PREFIX = TOKEN.split(":")[0]
 WEBHOOK_PATH = f"/webhook/{BOT_ID_PREFIX}"
 
@@ -30,9 +32,11 @@ POLICY_PDF = "policy.pdf"
 CONSENT_PDF = "consent2.pdf"
 EXCEL_FILE = "consents.xlsx"
 
+# ---------- aiogram v3 ----------
 router = Router()
 dp = Dispatcher()
 dp.include_router(router)
+bot = Bot(TOKEN)
 
 # ---------- Excel/PDF утилиты ----------
 def init_excel_if_needed(path: str):
@@ -110,7 +114,10 @@ async def start(m: Message):
         [types.InlineKeyboardButton(text="✅ Согласен", callback_data="agree"),
          types.InlineKeyboardButton(text="❌ Не согласен", callback_data="disagree")]
     ])
-    await m.answer("Здравствуйте! Ознакомьтесь с документами (PDF), затем нажмите «✅ Согласен» или «❌ Не согласен».", reply_markup=kb)
+    await m.answer(
+        "Здравствуйте! Ознакомьтесь с документами (PDF), затем нажмите «✅ Согласен» или «❌ Не согласен».",
+        reply_markup=kb
+    )
 
 @router.callback_query(F.data == "policy_pdf")
 async def send_policy_pdf(c: CallbackQuery):
@@ -178,47 +185,45 @@ async def report_cmd(m: Message):
         return
     await m.reply_document(FSInputFile(EXCEL_FILE), caption="Отчёт по согласиям (Excel)")
 
-# ---------- Webhook сервер (aiohttp) ----------
-async def on_startup(app: web.Application):
-    bot: Bot = app["bot"]
+# ---------- Webhook HTTP сервер (aiohttp) ----------
+async def on_startup(_app: web.Application):
     if not WEBHOOK_URL:
         logger.error("WEBHOOK_URL не задан (ENV). Установи WEBHOOK_URL в Render.")
         return
     try:
-        await bot.set_webhook(WEBHOOK_URL)
+        # сбрасываем хвост апдейтов на случай зависаний
+        await bot.set_webhook(WEBHOOK_URL, drop_pending_updates=True)
         logger.info("Webhook установлен: %s", WEBHOOK_URL)
     except Exception:
         logger.exception("Не удалось установить webhook")
 
-async def on_shutdown(app: web.Application):
-    bot: Bot = app["bot"]
+async def on_shutdown(_app: web.Application):
     try:
         await bot.delete_webhook(drop_pending_updates=True)
         logger.info("Webhook удалён")
     except Exception:
         logger.exception("Не удалось удалить webhook")
-    # важно: закрыть HTTP-сессию aiogram, чтобы не было "Unclosed client session"
+    # важно для aiogram 3: закрыть HTTP-сессию, иначе будут warnings Unclosed client session
     try:
         await bot.session.close()
     except Exception:
         pass
 
 async def handle(request: web.Request):
-    # Telegram шлёт JSON; валидируем и отправляем в Dispatcher (aiogram 3)
+    # Получаем JSON от Telegram и передаём апдейт в диспетчер (aiogram 3)
     try:
         data = await request.json()
     except Exception:
         return web.Response(status=400, text="no json")
 
-    update = Update.model_validate(data)
-    bot: Bot = request.app["bot"]
+    update = Update.model_validate(data)  # pydantic v2
     await dp.feed_update(bot, update)
     return web.Response(text="ok")
 
-def create_app() -> web.Application:
+# ---------- Запуск приложения ----------
+def create_app():
     app = web.Application()
-    app["bot"] = Bot(TOKEN)  # создаём бота и кладём в app, чтобы корректно закрывать
-    app.router.add_post(WEBHOOK_PATH, handle)
+    app.router.add_post(WEBHOOK_PATH, handle)  # путь должен совпадать с WEBHOOK_URL
     app.on_startup.append(on_startup)
     app.on_cleanup.append(on_shutdown)
     return app
