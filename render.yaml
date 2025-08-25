@@ -1,5 +1,5 @@
 services:
-  - type: background
+  - type: web
     name: telegram_bot
     env: python
     plan: free
@@ -12,3 +12,5 @@ services:
         value: "${TELEGRAM_TOKEN}"
       - key: ADMIN_ID
         value: "${ADMIN_ID}"
+      - key: WEBHOOK_URL
+        value: "${WEBHOOK_URL}"
