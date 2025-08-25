@@ -14,19 +14,19 @@ from reportlab.pdfgen import canvas
 from openpyxl import Workbook, load_workbook
 from openpyxl.utils import get_column_letter
 
-# Включаем логирование
+# ── Логирование ──────────────────────────────────────────────────────────────
 logging.basicConfig(level=logging.INFO)
 
-# ── НАСТРОЙКИ ───────────────────────────────────────────────────────────────
-TOKEN = "8475192387:AAESFlpUUqJzlqPTQkcAv1sDVeZJSFOQV0w"   # твой токен
+# ── НАСТРОЙКИ ────────────────────────────────────────────────────────────────
+TOKEN = "8475192387:AAESFlpUUqJzlqPTQkcAv1sDVeZJSFOQV0w"  # твой токен
 
-POLICY_PDF = "policy.pdf"     
+POLICY_PDF = "policy.pdf"      # готовая Политика (PDF)
 CONSENT_PDF = "consent2.pdf"   # исправлено название файла согласия
-EXCEL_FILE = "consents.xlsx"  
+EXCEL_FILE = "consents.xlsx"   # лог согласий
 
 router = Router()
 
-# ── СОЗДАНИЕ PDF ПОДТВЕРЖДЕНИЯ ─────────────────────────────────────────────
+# ── СОЗДАНИЕ PDF ПОДТВЕРЖДЕНИЯ ──────────────────────────────────────────────
 def make_confirmation_pdf(filename: str, user, status: str, ts: str) -> str:
     c = canvas.Canvas(filename, pagesize=A4)
     width, height = A4
@@ -64,7 +64,7 @@ def make_confirmation_pdf(filename: str, user, status: str, ts: str) -> str:
     c.save()
     return filename
 
-# ── EXCEL: СОЗДАНИЕ И ЗАПИСЬ ───────────────────────────────────────────────
+# ── EXCEL: СОЗДАНИЕ И ЗАПИСЬ ────────────────────────────────────────────────
 def init_excel_if_needed(path: str):
     if os.path.exists(path):
         return
@@ -157,7 +157,7 @@ async def main():
     dp = Dispatcher()
     dp.include_router(router)
 
-    # Удаляем старый webhook на всякий случай
+    # Всегда удаляем старый webhook
     await bot.delete_webhook(drop_pending_updates=True)
 
     logging.info("Бот запущен...")
