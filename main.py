@@ -26,7 +26,7 @@ TOKEN = "8475192387:AAESFlpUUqJzlqPTQkcAv1sDVeZJSFOQV0w"
 
 # 🔧 Файлы
 POLICY_PDF = "policy.pdf"
-CONSENT_PDF = "consent.pdf"
+CONSENT_PDF = "consent2.pdf"
 EXCEL_FILE = "consents.xlsx"
 
 # 🔧 ID администратора (замени на свой при необходимости)
@@ -258,3 +258,4 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+
