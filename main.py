@@ -1,8 +1,8 @@
 import asyncio
 import logging
 import os
-import time
 import shutil
+import time
 from datetime import datetime
 from textwrap import wrap
 
@@ -18,7 +18,6 @@ from reportlab.pdfbase.ttfonts import TTFont
 from openpyxl import Workbook, load_workbook
 from openpyxl.utils import get_column_letter
 
-# HTTP-сервер для Render Free (чтобы не засыпал Web Service)
 from aiohttp import web
 
 logging.basicConfig(level=logging.INFO)
@@ -33,6 +32,11 @@ EXCEL_FILE = "consents.xlsx"
 
 # 🔧 ID администратора
 ADMIN_ID = 1227847495
+
+# 🔧 Webhook config
+WEBHOOK_PATH = "/webhook"
+BASE_WEB_URL = os.getenv("RENDER_EXTERNAL_URL", "https://telegram-bot-hdtw.onrender.com")
+WEBHOOK_URL = f"{BASE_WEB_URL}{WEBHOOK_PATH}"
 
 # Подключаем шрифты
 pdfmetrics.registerFont(TTFont("DejaVu", "DejaVuSans.ttf"))
@@ -145,7 +149,6 @@ async def send_policy_pdf(c: CallbackQuery):
     if not os.path.exists(POLICY_PDF):
         await c.answer("Файл policy.pdf не найден рядом с ботом.", show_alert=True)
         return
-    # ломаем кэш Телеграма: новое имя файла на лету
     f = FSInputFile(POLICY_PDF, filename=f"policy_{int(time.time())}.pdf")
     await c.message.answer_document(f, caption="Политика конфиденциальности (PDF)")
     await c.answer()
@@ -166,21 +169,15 @@ async def consent_handler(c: CallbackQuery):
     ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
     existing_status = get_user_status(EXCEL_FILE, user.id)
-
-    # защита от повторов
     if existing_status == "Согласен":
         await c.answer("Ваш выбор уже зафиксирован: Согласен. Изменить нельзя.", show_alert=True)
         return
     elif existing_status == "Не согласен" and status == "Не согласен":
         await c.answer("Вы уже отказались ранее. Ответ зафиксирован.", show_alert=True)
         return
-    elif existing_status == "Не согласен" and status == "Согласен":
-        pass  # разрешаем согласиться после отказа
 
-    # запись в Excel
     append_excel_entry(EXCEL_FILE, ts, user, status)
 
-    # уведомление админу
     try:
         text = (f"Новый ответ!\n"
                 f"ID: {user.id}\n"
@@ -190,28 +187,25 @@ async def consent_handler(c: CallbackQuery):
                 f"Время: {ts}")
         await c.bot.send_message(ADMIN_ID, text)
     except Exception as e:
-        logging.warning(f"Не удалось отправить уведомление админу: {e}")
+        logging.warning(f"Не удалось уведомить админа: {e}")
 
-    # ответ пользователю
     if status == "Согласен":
         pdf_name = f"Подтверждение_{user.id}.pdf"
         make_confirmation_pdf(pdf_name, user, status, ts)
         await c.message.edit_text("Спасибо! Ваш выбор зафиксирован: Согласен")
         await c.message.answer_document(FSInputFile(pdf_name, filename=f"confirm_{int(time.time())}.pdf"),
                                         caption="Ваше подтверждение (PDF)")
-        try:
-            os.remove(pdf_name)  # удаляем временный файл
-        except Exception:
-            pass
+        try: os.remove(pdf_name)
+        except: pass
     else:
-        await c.message.edit_text("Отказ зафиксирован. Если передумаете — вы сможете согласиться один раз.")
+        await c.message.edit_text("Отказ зафиксирован. Если передумаете — сможете согласиться один раз.")
 
     await c.answer()
 
 @router.message(Command("report"))
 async def send_report(m: Message):
     if m.from_user.id != ADMIN_ID:
-        await m.answer("⛔ У вас нет доступа к этой команде")
+        await m.answer("⛔ Нет доступа")
         return
     if not os.path.exists(EXCEL_FILE):
         await m.answer("Файл consents.xlsx ещё не создан")
@@ -222,59 +216,37 @@ async def send_report(m: Message):
     shutil.copy(EXCEL_FILE, temp_name)
 
     await m.answer_document(FSInputFile(temp_name), caption="📊 Отчёт по согласиям")
+    try: os.remove(temp_name)
+    except: pass
 
-    try:
-        os.remove(temp_name)
-    except Exception:
-        pass
+# ───────────────────────── WEBHOOK ─────────────────────────
+async def on_startup(bot: Bot):
+    await bot.set_webhook(WEBHOOK_URL)
 
-@router.message(Command("help"))
-async def help_cmd(m: Message):
-    await m.answer(
-        "Команды:\n"
-        "• /start — показать кнопки\n"
-        "• /ping — проверить, что бот жив\n"
-        "• /report — админ получает consents.xlsx\n"
-    )
+async def on_shutdown(bot: Bot):
+    await bot.delete_webhook()
 
-@router.message()
-async def any_message(m: Message):
-    await m.answer(
-        "Здравствуйте! Для начала работы нажмите «📄/📝» или выберите «✅/❌».\nТакже доступна команда /start.",
-        reply_markup=start_keyboard()
-    )
-
-# ─────────────── HTTP-сервер для Render ───────────────
-async def health(request):
-    return web.Response(text="ok")
-
-async def run_http_server():
-    app = web.Application()
-    app.router.add_get("/", health)
-    app.router.add_get("/health", health)
-
-    port = int(os.getenv("PORT", "10000"))  # Render задаёт порт через переменную PORT
-    runner = web.AppRunner(app)
-    await runner.setup()
-    site = web.TCPSite(runner, host="0.0.0.0", port=port)
-    await site.start()
-
-    await asyncio.Event().wait()
-
-# ───────────────────────── Запуск ─────────────────────────
-async def run_bot():
+async def main():
     bot = Bot(TOKEN)
     dp = Dispatcher()
     dp.include_router(router)
-    await bot.delete_webhook(drop_pending_updates=True)
-    await dp.start_polling(bot)
 
-async def main():
-    await asyncio.gather(
-        run_http_server(),
-        run_bot(),
-    )
+    app = web.Application()
+    app.router.add_post(WEBHOOK_PATH, dp.webhook_handler)
+
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", int(os.getenv("PORT", 10000)))
+    await site.start()
+
+    await on_startup(bot)
+    logging.info(f"Webhook set: {WEBHOOK_URL}")
+
+    try:
+        while True:
+            await asyncio.sleep(3600)
+    finally:
+        await on_shutdown(bot)
 
 if __name__ == "__main__":
     asyncio.run(main())
-
