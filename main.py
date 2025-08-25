@@ -18,22 +18,21 @@ from openpyxl.utils import get_column_letter
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# ---------- Настройки (через ENV рекомендуем) ----------
+# ---------- Настройки ----------
 TOKEN = os.environ.get("TELEGRAM_TOKEN", "8475192387:AAESFlpUUqJzlqPTQkcAv1sDVeZJSFOQV0w")
 ADMIN_ID = int(os.environ.get("ADMIN_ID", "1227847495"))
 
-# Важно: задай в Render переменную WEBHOOK_URL с полным публичным URL,
-# например: https://telegram-bot-hdtw.onrender.com/webhook/8475192387
 WEBHOOK_URL = os.environ.get("WEBHOOK_URL")  # обязателен
-# Путь, который мы добавим в роутер (уникальный по id бота)
 BOT_ID_PREFIX = TOKEN.split(":")[0]
 WEBHOOK_PATH = f"/webhook/{BOT_ID_PREFIX}"
 
 POLICY_PDF = "policy.pdf"
-CONSENT_PDF = "consent2.pdf"   # у тебя consent2.pdf
+CONSENT_PDF = "consent2.pdf"
 EXCEL_FILE = "consents.xlsx"
 
 router = Router()
+dp = Dispatcher()
+dp.include_router(router)
 
 # ---------- Excel/PDF утилиты ----------
 def init_excel_if_needed(path: str):
@@ -102,7 +101,7 @@ def make_confirmation_pdf(filename: str, user, status: str, ts: str) -> str:
     c.save()
     return filename
 
-# ---------- Хэндлеры aiogram ----------
+# ---------- Хэндлеры ----------
 @router.message(CommandStart())
 async def start(m: Message):
     kb = types.InlineKeyboardMarkup(inline_keyboard=[
@@ -179,9 +178,9 @@ async def report_cmd(m: Message):
         return
     await m.reply_document(FSInputFile(EXCEL_FILE), caption="Отчёт по согласиям (Excel)")
 
-# ---------- Webhook HTTP сервер (aiohttp) ----------
-async def on_startup(bot: Bot):
-    # выставим webhook
+# ---------- Webhook сервер (aiohttp) ----------
+async def on_startup(app: web.Application):
+    bot: Bot = app["bot"]
     if not WEBHOOK_URL:
         logger.error("WEBHOOK_URL не задан (ENV). Установи WEBHOOK_URL в Render.")
         return
@@ -191,37 +190,37 @@ async def on_startup(bot: Bot):
     except Exception:
         logger.exception("Не удалось установить webhook")
 
-async def on_shutdown(bot: Bot):
+async def on_shutdown(app: web.Application):
+    bot: Bot = app["bot"]
     try:
         await bot.delete_webhook(drop_pending_updates=True)
         logger.info("Webhook удалён")
     except Exception:
         logger.exception("Не удалось удалить webhook")
+    # важно: закрыть HTTP-сессию aiogram, чтобы не было "Unclosed client session"
+    try:
+        await bot.session.close()
+    except Exception:
+        pass
 
 async def handle(request: web.Request):
+    # Telegram шлёт JSON; валидируем и отправляем в Dispatcher (aiogram 3)
     try:
         data = await request.json()
     except Exception:
         return web.Response(status=400, text="no json")
 
-    # aiogram 3.x: корректная валидация апдейта и передача его диспетчеру
     update = Update.model_validate(data)
+    bot: Bot = request.app["bot"]
     await dp.feed_update(bot, update)
-
     return web.Response(text="ok")
 
-# ---------- Запуск приложения ----------
-bot = Bot(TOKEN)
-dp = Dispatcher()
-dp.include_router(router)
-
-def create_app():
+def create_app() -> web.Application:
     app = web.Application()
-    # путь должен совпадать с WEBHOOK_PATH, который указан в WEBHOOK_URL
+    app["bot"] = Bot(TOKEN)  # создаём бота и кладём в app, чтобы корректно закрывать
     app.router.add_post(WEBHOOK_PATH, handle)
-    # на старте/шутдауне установим/удалим webhook
-    app.on_startup.append(lambda app: on_startup(bot))
-    app.on_cleanup.append(lambda app: on_shutdown(bot))
+    app.on_startup.append(on_startup)
+    app.on_cleanup.append(on_shutdown)
     return app
 
 if __name__ == "__main__":
@@ -231,4 +230,3 @@ if __name__ == "__main__":
     app = create_app()
     port = int(os.environ.get("PORT", 10000))
     web.run_app(app, host="0.0.0.0", port=port)
-
