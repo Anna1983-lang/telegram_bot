@@ -199,15 +199,15 @@ async def on_shutdown(bot: Bot):
         logger.exception("Не удалось удалить webhook")
 
 async def handle(request: web.Request):
-    # Простейшая проверка пути
-    # Обрабатываем JSON от Telegram
     try:
         data = await request.json()
     except Exception:
         return web.Response(status=400, text="no json")
-    update = Update(**data)
-    # process_update через Dispatcher
-    await dp.process_update(update)
+
+    # aiogram 3.x: корректная валидация апдейта и передача его диспетчеру
+    update = Update.model_validate(data)
+    await dp.feed_update(bot, update)
+
     return web.Response(text="ok")
 
 # ---------- Запуск приложения ----------
@@ -231,3 +231,4 @@ if __name__ == "__main__":
     app = create_app()
     port = int(os.environ.get("PORT", 10000))
     web.run_app(app, host="0.0.0.0", port=port)
+
