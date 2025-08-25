@@ -16,6 +16,9 @@ from reportlab.pdfbase.ttfonts import TTFont
 from openpyxl import Workbook, load_workbook
 from openpyxl.utils import get_column_letter
 
+# ── для маленького HTTP-сервера (Render Free любит, когда «слушают порт»)
+from aiohttp import web
+
 logging.basicConfig(level=logging.INFO)
 
 # 🔑 Токен бота
@@ -26,7 +29,7 @@ POLICY_PDF = "policy.pdf"
 CONSENT_PDF = "consent.pdf"
 EXCEL_FILE = "consents.xlsx"
 
-# 🔧 ID администратора (замени на свой!)
+# 🔧 ID администратора (замени на свой при необходимости)
 ADMIN_ID = 1227847495
 
 # Подключаем шрифты (обязательно положи в папку .ttf)
@@ -111,7 +114,7 @@ def make_confirmation_pdf(filename: str, user, status: str, ts: str) -> str:
     c.save()
     return filename
 
-# ── Хэндлеры ──────────────────────────────────────────────
+# ── Хэндлеры бота ─────────────────────────────────────────
 @router.message(CommandStart())
 async def start(m: Message):
     kb = types.InlineKeyboardMarkup(inline_keyboard=[
@@ -128,6 +131,10 @@ async def start(m: Message):
         "Здравствуйте! Ознакомьтесь с документами (PDF), затем нажмите «✅ Согласен» или «❌ Не согласен».",
         reply_markup=kb
     )
+
+@router.message(Command("ping"))
+async def ping(m: Message):
+    await m.answer("pong ✅")
 
 @router.callback_query(F.data == "policy_pdf")
 async def send_policy_pdf(c: CallbackQuery):
@@ -153,7 +160,7 @@ async def consent_handler(c: CallbackQuery):
 
     existing_status = get_user_status(EXCEL_FILE, user.id)
 
-    # 🔒 Логика защиты
+    # 🔒 Защита от повторных ответов
     if existing_status == "Согласен":
         await c.answer("Ваш выбор уже зафиксирован: Согласен. Изменить нельзя.", show_alert=True)
         return
@@ -208,20 +215,46 @@ async def help_cmd(m: Message):
     await m.answer(
         "Команды:\n"
         "• /start — показать кнопки\n"
+        "• /ping — проверить, что бот жив\n"
         "• 📄 Политика — отправляет policy.pdf\n"
         "• 📝 Согласие — отправляет consent.pdf\n"
         "• ✅/❌ — зафиксировать выбор (повторное изменение запрещено)\n"
         "• /report — админ получает consents.xlsx\n"
     )
 
-# ── Запуск ────────────────────────────────────────────────
-async def main():
+# ── HTTP-сервер для Render Free ───────────────────────────
+async def health(request):
+    return web.Response(text="ok")
+
+async def run_http_server():
+    app = web.Application()
+    app.router.add_get("/", health)
+    app.router.add_get("/health", health)
+
+    port = int(os.getenv("PORT", "10000"))  # Render задаёт порт через переменную PORT
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, host="0.0.0.0", port=port)
+    await site.start()
+
+    # держим сервер живым
+    await asyncio.Event().wait()
+
+# ── Запуск бота ───────────────────────────────────────────
+async def run_bot():
     bot = Bot(TOKEN)
     dp = Dispatcher()
     dp.include_router(router)
+    # удаляем возможный webhook, чтобы polling не конфликтовал
     await bot.delete_webhook(drop_pending_updates=True)
     await dp.start_polling(bot)
 
+# ── Общий запуск: HTTP + Bot параллельно ──────────────────
+async def main():
+    await asyncio.gather(
+        run_http_server(),
+        run_bot(),
+    )
+
 if __name__ == "__main__":
     asyncio.run(main())
-
