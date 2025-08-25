@@ -27,7 +27,7 @@ CONSENT_PDF = "consent.pdf"
 EXCEL_FILE = "consents.xlsx"
 
 # 🔧 ID администратора (замени на свой!)
-ADMIN_ID = 123456789
+ADMIN_ID = 1227847495
 
 # Подключаем шрифты (обязательно положи в папку .ttf)
 pdfmetrics.registerFont(TTFont("DejaVu", "DejaVuSans.ttf"))
@@ -224,3 +224,4 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+
