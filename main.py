@@ -1,13 +1,13 @@
 # main.py
-import asyncio
-import logging
 import os
+import logging
 from datetime import datetime
 from textwrap import wrap
+from aiohttp import web
 
 from aiogram import Bot, Dispatcher, Router, types, F
 from aiogram.filters import CommandStart, Command
-from aiogram.types import Message, CallbackQuery, FSInputFile
+from aiogram.types import Message, CallbackQuery, FSInputFile, Update
 
 from reportlab.lib.pagesizes import A4
 from reportlab.pdfgen import canvas
@@ -18,19 +18,24 @@ from openpyxl.utils import get_column_letter
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# ---------- Настройки ----------
-# Токен: читаем из ENV, если нет — можно временно вставить строкой (не рекомендую)
+# ---------- Настройки (через ENV рекомендуем) ----------
 TOKEN = os.environ.get("TELEGRAM_TOKEN", "8475192387:AAESFlpUUqJzlqPTQkcAv1sDVeZJSFOQV0w")
-# ADMIN ID: читает из ENV или можно заменить на число
 ADMIN_ID = int(os.environ.get("ADMIN_ID", "1227847495"))
 
-POLICY_PDF = "policy.pdf"       # файл политики (в репо)
-CONSENT_PDF = "consent2.pdf"    # файл согласия (в репо) — ты сказала он переименован
-EXCEL_FILE = "consents.xlsx"    # единый Excel-файл
+# Важно: задай в Render переменную WEBHOOK_URL с полным публичным URL,
+# например: https://telegram-bot-hdtw.onrender.com/webhook/8475192387
+WEBHOOK_URL = os.environ.get("WEBHOOK_URL")  # обязателен
+# Путь, который мы добавим в роутер (уникальный по id бота)
+BOT_ID_PREFIX = TOKEN.split(":")[0]
+WEBHOOK_PATH = f"/webhook/{BOT_ID_PREFIX}"
+
+POLICY_PDF = "policy.pdf"
+CONSENT_PDF = "consent2.pdf"   # у тебя consent2.pdf
+EXCEL_FILE = "consents.xlsx"
 
 router = Router()
 
-# ---------- Утилиты для Excel/PDF ----------
+# ---------- Excel/PDF утилиты ----------
 def init_excel_if_needed(path: str):
     if os.path.exists(path):
         return
@@ -44,14 +49,12 @@ def init_excel_if_needed(path: str):
     wb.save(path)
 
 def read_last_status_for_user(path: str, user_id: int):
-    """Возвращает последний статус для user_id или None."""
     if not os.path.exists(path):
         return None
     wb = load_workbook(path, read_only=True)
     ws = wb.active
     last = None
     for row in ws.iter_rows(min_row=2, values_only=True):
-        # row: Timestamp, User ID, Username, First, Last, Status
         try:
             uid = int(row[1])
         except Exception:
@@ -64,25 +67,16 @@ def append_excel_entry(path: str, ts: str, user, status: str):
     init_excel_if_needed(path)
     wb = load_workbook(path)
     ws = wb.active
-    ws.append([
-        ts,
-        user.id,
-        user.username or "",
-        user.first_name or "",
-        user.last_name or "",
-        status
-    ])
+    ws.append([ts, user.id, user.username or "", user.first_name or "", user.last_name or "", status])
     wb.save(path)
 
 def make_confirmation_pdf(filename: str, user, status: str, ts: str) -> str:
     c = canvas.Canvas(filename, pagesize=A4)
     width, height = A4
     y = height - 40
-
     c.setFont("Helvetica-Bold", 14)
-    c.drawString(40, y, "Подтверждение выбора по согласию на обработку персональных данных")
+    c.drawString(40, y, "Подтверждение выбора по согласию на обработку ПДн")
     y -= 26
-
     c.setFont("Helvetica", 11)
     header = [
         f"Выбор: {status}",
@@ -96,7 +90,6 @@ def make_confirmation_pdf(filename: str, user, status: str, ts: str) -> str:
             c.drawString(40, y, line)
             y -= 16
     y -= 8
-
     body = ("Настоящим подтверждается зафиксированное волеизъявление пользователя в электронном виде. "
             "Содержание согласия и политики конфиденциальности предоставлено пользователю в виде файлов PDF.")
     for line in wrap(body, 100):
@@ -106,32 +99,24 @@ def make_confirmation_pdf(filename: str, user, status: str, ts: str) -> str:
             c.setFont("Helvetica", 11)
         c.drawString(40, y, line)
         y -= 16
-
     c.save()
     return filename
 
-# ---------- Хэндлеры ----------
+# ---------- Хэндлеры aiogram ----------
 @router.message(CommandStart())
 async def start(m: Message):
     kb = types.InlineKeyboardMarkup(inline_keyboard=[
-        [
-            types.InlineKeyboardButton(text="📄 Политика (PDF)", callback_data="policy_pdf"),
-            types.InlineKeyboardButton(text="📝 Согласие (PDF)", callback_data="consent_pdf"),
-        ],
-        [
-            types.InlineKeyboardButton(text="✅ Согласен", callback_data="agree"),
-            types.InlineKeyboardButton(text="❌ Не согласен", callback_data="disagree"),
-        ],
+        [types.InlineKeyboardButton(text="📄 Политика (PDF)", callback_data="policy_pdf"),
+         types.InlineKeyboardButton(text="📝 Согласие (PDF)", callback_data="consent_pdf")],
+        [types.InlineKeyboardButton(text="✅ Согласен", callback_data="agree"),
+         types.InlineKeyboardButton(text="❌ Не согласен", callback_data="disagree")]
     ])
-    await m.answer(
-        "Здравствуйте! Ознакомьтесь с документами (PDF), затем нажмите «✅ Согласен» или «❌ Не согласен».",
-        reply_markup=kb
-    )
+    await m.answer("Здравствуйте! Ознакомьтесь с документами (PDF), затем нажмите «✅ Согласен» или «❌ Не согласен».", reply_markup=kb)
 
 @router.callback_query(F.data == "policy_pdf")
 async def send_policy_pdf(c: CallbackQuery):
     if not os.path.exists(POLICY_PDF):
-        await c.answer("Файл policy.pdf не найден рядом с ботом.", show_alert=True)
+        await c.answer("Файл policy.pdf не найден.", show_alert=True)
         return
     await c.message.answer_document(FSInputFile(POLICY_PDF), caption="Политика конфиденциальности (PDF)")
     await c.answer()
@@ -139,7 +124,7 @@ async def send_policy_pdf(c: CallbackQuery):
 @router.callback_query(F.data == "consent_pdf")
 async def send_consent_pdf(c: CallbackQuery):
     if not os.path.exists(CONSENT_PDF):
-        await c.answer(f"Файл {CONSENT_PDF} не найден рядом с ботом.", show_alert=True)
+        await c.answer(f"Файл {CONSENT_PDF} не найден.", show_alert=True)
         return
     await c.message.answer_document(FSInputFile(CONSENT_PDF), caption="Текст согласия (PDF)")
     await c.answer()
@@ -151,33 +136,25 @@ async def consent_handler(c: CallbackQuery):
     status = "Согласен" if action == "agree" else "Не согласен"
     ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-    # Проверка предыдущего статуса
     last = read_last_status_for_user(EXCEL_FILE, user.id)
-    # Если уже согласился — изменить нельзя
     if last == "Согласен":
         await c.answer("Ваш выбор уже зафиксирован: Согласен. Изменить нельзя.", show_alert=True)
         return
+    if last == "Не согласен" and action == "disagree":
+        await c.answer("Ваш выбор уже зафиксирован: Не согласен. Изменить нельзя.", show_alert=True)
+        return
 
-    # Если ранее был отказ — можно дать согласие только один раз.
-    if last == "Не согласен":
-        if action == "disagree":
-            await c.answer("Ваш выбор уже зафиксирован: Не согласен. Изменить нельзя.", show_alert=True)
-            return
-        # если был "Не согласен" и сейчас нажали "agree" — разрешаем и фиксируем.
-
-    # Записываем результат в Excel
     append_excel_entry(EXCEL_FILE, ts, user, status)
 
-    # Ответ пользователю
     if status == "Согласен":
         tmp_pdf = f"confirmation_{user.id}.pdf"
         try:
             make_confirmation_pdf(tmp_pdf, user, status, ts)
             await c.message.edit_text(f"Спасибо! Ваш выбор зафиксирован: {status}")
             await c.message.answer_document(FSInputFile(tmp_pdf), caption="Ваше подтверждение (PDF)")
-        except Exception as e:
+        except Exception:
             logger.exception("Ошибка при генерации PDF")
-            await c.message.edit_text(f"Спасибо! Ваш выбор зафиксирован: {status} (ошибка генерации PDF)")
+            await c.message.edit_text(f"Спасибо! Ваш выбор зафиксирован: {status} (ошибка при создании PDF).")
         finally:
             try:
                 if os.path.exists(tmp_pdf):
@@ -186,40 +163,71 @@ async def consent_handler(c: CallbackQuery):
                 pass
     else:
         await c.message.edit_text("Отказ зафиксирован. Если передумаете — отправьте /start и согласуйте заново.")
-
     await c.answer()
 
 @router.message(Command("help"))
 async def help_cmd(m: Message):
-    await m.answer(
-        "Команды:\n"
-        "• /start — показать кнопки\n"
-        "• /report — отправить Excel-отчёт администратору\n"
-        "• Кнопки: Политика (PDF), Согласие (PDF), ✅/❌"
-    )
+    await m.answer("Команды:\n• /start\n• /report — отправка Excel-отчёта (только администратору)")
 
 @router.message(Command("report"))
 async def report_cmd(m: Message):
-    # Отправляем отчет только администратору
     if m.from_user.id != ADMIN_ID:
         await m.reply("Команда доступна только администратору.")
         return
     if not os.path.exists(EXCEL_FILE):
-        await m.reply("Отчет пока пуст (файл не найден).")
+        await m.reply("Отчёт пока пуст (файл не найден).")
         return
     await m.reply_document(FSInputFile(EXCEL_FILE), caption="Отчёт по согласиям (Excel)")
 
-# ---------- Запуск ----------
-async def main():
-    bot = Bot(TOKEN)
-    dp = Dispatcher()
-    dp.include_router(router)
-    # Удаляем webhook если вдруг (чтобы не мешал polling)
+# ---------- Webhook HTTP сервер (aiohttp) ----------
+async def on_startup(bot: Bot):
+    # выставим webhook
+    if not WEBHOOK_URL:
+        logger.error("WEBHOOK_URL не задан (ENV). Установи WEBHOOK_URL в Render.")
+        return
+    try:
+        await bot.set_webhook(WEBHOOK_URL)
+        logger.info("Webhook установлен: %s", WEBHOOK_URL)
+    except Exception:
+        logger.exception("Не удалось установить webhook")
+
+async def on_shutdown(bot: Bot):
     try:
         await bot.delete_webhook(drop_pending_updates=True)
+        logger.info("Webhook удалён")
     except Exception:
-        pass
-    await dp.start_polling(bot)
+        logger.exception("Не удалось удалить webhook")
+
+async def handle(request: web.Request):
+    # Простейшая проверка пути
+    # Обрабатываем JSON от Telegram
+    try:
+        data = await request.json()
+    except Exception:
+        return web.Response(status=400, text="no json")
+    update = Update(**data)
+    # process_update через Dispatcher
+    await dp.process_update(update)
+    return web.Response(text="ok")
+
+# ---------- Запуск приложения ----------
+bot = Bot(TOKEN)
+dp = Dispatcher()
+dp.include_router(router)
+
+def create_app():
+    app = web.Application()
+    # путь должен совпадать с WEBHOOK_PATH, который указан в WEBHOOK_URL
+    app.router.add_post(WEBHOOK_PATH, handle)
+    # на старте/шутдауне установим/удалим webhook
+    app.on_startup.append(lambda app: on_startup(bot))
+    app.on_cleanup.append(lambda app: on_shutdown(bot))
+    return app
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    if not WEBHOOK_URL:
+        logger.error("ERROR: WEBHOOK_URL environment variable is not set. Set it to the full public webhook URL.")
+        raise SystemExit(1)
+    app = create_app()
+    port = int(os.environ.get("PORT", 10000))
+    web.run_app(app, host="0.0.0.0", port=port)
