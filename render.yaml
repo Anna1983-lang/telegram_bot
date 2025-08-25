@@ -1,5 +1,5 @@
 services:
-  - type: web
+  - type: background
     name: telegram_bot
     env: python
     plan: free
@@ -8,3 +8,7 @@ services:
     envVars:
       - key: PYTHON_VERSION
         value: "3.11"
+      - key: TELEGRAM_TOKEN
+        value: "${TELEGRAM_TOKEN}"
+      - key: ADMIN_ID
+        value: "${ADMIN_ID}"
