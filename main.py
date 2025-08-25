@@ -21,10 +21,7 @@ logger = logging.getLogger(__name__)
 # ---------- Настройки (ENV) ----------
 TOKEN = os.environ.get("TELEGRAM_TOKEN", "8475192387:AAESFlpUUqJzlqPTQkcAv1sDVeZJSFOQV0w")
 ADMIN_ID = int(os.environ.get("ADMIN_ID", "1227847495"))
-
-# Обязателен на Render, пример:
-# https://telegram-bot-aum2.onrender.com/webhook/8475192387
-WEBHOOK_URL = os.environ.get("WEBHOOK_URL")
+WEBHOOK_URL = os.environ.get("WEBHOOK_URL")  # пример: https://telegram-bot-aum2.onrender.com/webhook/8475192387
 BOT_ID_PREFIX = TOKEN.split(":")[0]
 WEBHOOK_PATH = f"/webhook/{BOT_ID_PREFIX}"
 
@@ -114,10 +111,15 @@ async def start(m: Message):
         [types.InlineKeyboardButton(text="✅ Согласен", callback_data="agree"),
          types.InlineKeyboardButton(text="❌ Не согласен", callback_data="disagree")]
     ])
-    await m.answer(
-        "Здравствуйте! Ознакомьтесь с документами (PDF), затем нажмите «✅ Согласен» или «❌ Не согласен».",
-        reply_markup=kb
-    )
+    await m.answer("Здравствуйте! Ознакомьтесь с документами (PDF), затем нажмите «✅ Согласен» или «❌ Не согласен».", reply_markup=kb)
+
+@router.message(Command("id"))
+async def whoami(m: Message):
+    await m.answer(f"Ваш ID: {m.from_user.id}")
+
+@router.message(Command("ping"))
+async def ping(m: Message):
+    await m.answer("pong")
 
 @router.callback_query(F.data == "policy_pdf")
 async def send_policy_pdf(c: CallbackQuery):
@@ -173,17 +175,21 @@ async def consent_handler(c: CallbackQuery):
 
 @router.message(Command("help"))
 async def help_cmd(m: Message):
-    await m.answer("Команды:\n• /start\n• /report — отправка Excel-отчёта (только администратору)")
+    await m.answer("Команды:\n• /start\n• /id\n• /ping\n• /report — отправка Excel-отчёта (только администратору)")
 
 @router.message(Command("report"))
 async def report_cmd(m: Message):
     if m.from_user.id != ADMIN_ID:
-        await m.reply("Команда доступна только администратору.")
+        await m.answer("Команда доступна только администратору.")
         return
     if not os.path.exists(EXCEL_FILE):
-        await m.reply("Отчёт пока пуст (файл не найден).")
+        await m.answer("Отчёт пока пуст (файл не найден).")
         return
-    await m.reply_document(FSInputFile(EXCEL_FILE), caption="Отчёт по согласиям (Excel)")
+    try:
+        await m.answer_document(FSInputFile(EXCEL_FILE), caption="Отчёт по согласиям (Excel)")
+    except Exception as e:
+        logger.exception("Не удалось отправить Excel: %s", e)
+        await m.answer("Ошибка при отправке отчёта. Проверьте логи.")
 
 # ---------- Webhook HTTP сервер (aiohttp) ----------
 async def on_startup(_app: web.Application):
@@ -191,7 +197,9 @@ async def on_startup(_app: web.Application):
         logger.error("WEBHOOK_URL не задан (ENV). Установи WEBHOOK_URL в Render.")
         return
     try:
-        # сбрасываем хвост апдейтов на случай зависаний
+        me = await bot.get_me()
+        logger.info("Bot started as @%s (id=%s). ADMIN_ID=%s", me.username, me.id, ADMIN_ID)
+        # сбрасываем хвост апдейтов и ставим вебхук
         await bot.set_webhook(WEBHOOK_URL, drop_pending_updates=True)
         logger.info("Webhook установлен: %s", WEBHOOK_URL)
     except Exception:
@@ -203,7 +211,7 @@ async def on_shutdown(_app: web.Application):
         logger.info("Webhook удалён")
     except Exception:
         logger.exception("Не удалось удалить webhook")
-    # важно для aiogram 3: закрыть HTTP-сессию, иначе будут warnings Unclosed client session
+    # Важно: закрыть HTTP-сессию, чтобы не было warnings "Unclosed client session"
     try:
         await bot.session.close()
     except Exception:
@@ -215,14 +223,25 @@ async def handle(request: web.Request):
         data = await request.json()
     except Exception:
         return web.Response(status=400, text="no json")
+    try:
+        update = Update.model_validate(data)  # pydantic v2
+        await dp.feed_update(bot, update)
+        return web.Response(text="ok")
+    except Exception:
+        logger.exception("Ошибка обработки апдейта")
+        return web.Response(status=500, text="error")
 
-    update = Update.model_validate(data)  # pydantic v2
-    await dp.feed_update(bot, update)
+# Доп. эндпоинты для здоровья
+async def root(_request: web.Request):
+    return web.Response(text="ok")
+async def healthz(_request: web.Request):
     return web.Response(text="ok")
 
 # ---------- Запуск приложения ----------
 def create_app():
     app = web.Application()
+    app.router.add_get("/", root)
+    app.router.add_get("/healthz", healthz)
     app.router.add_post(WEBHOOK_PATH, handle)  # путь должен совпадать с WEBHOOK_URL
     app.on_startup.append(on_startup)
     app.on_cleanup.append(on_shutdown)
