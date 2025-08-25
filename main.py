@@ -1,6 +1,8 @@
 import asyncio
 import logging
 import os
+import time
+import shutil
 from datetime import datetime
 from textwrap import wrap
 
@@ -16,29 +18,29 @@ from reportlab.pdfbase.ttfonts import TTFont
 from openpyxl import Workbook, load_workbook
 from openpyxl.utils import get_column_letter
 
-# ── для маленького HTTP-сервера (Render Free любит, когда «слушают порт»)
+# HTTP-сервер для Render Free (чтобы не засыпал Web Service)
 from aiohttp import web
 
 logging.basicConfig(level=logging.INFO)
 
-# 🔑 Токен бота
+# 🔑 Токен
 TOKEN = "8475192387:AAESFlpUUqJzlqPTQkcAv1sDVeZJSFOQV0w"
 
 # 🔧 Файлы
 POLICY_PDF = "policy.pdf"
-CONSENT_PDF = "consent2.pdf"
+CONSENT_PDF = "consent.pdf"
 EXCEL_FILE = "consents.xlsx"
 
-# 🔧 ID администратора (замени на свой при необходимости)
+# 🔧 ID администратора
 ADMIN_ID = 1227847495
 
-# Подключаем шрифты (обязательно положи в папку .ttf)
+# Подключаем шрифты
 pdfmetrics.registerFont(TTFont("DejaVu", "DejaVuSans.ttf"))
 pdfmetrics.registerFont(TTFont("DejaVu-Bold", "DejaVuSans-Bold.ttf"))
 
 router = Router()
 
-# ── Excel ──────────────────────────────────────────────
+# ───────────────────────── Excel ─────────────────────────
 def init_excel_if_needed(path: str):
     if os.path.exists(path):
         return
@@ -75,7 +77,7 @@ def get_user_status(path: str, user_id: int):
             return row[5]  # Status
     return None
 
-# ── PDF подтверждение ─────────────────────────────────────
+# ─────────────── PDF подтверждение (кириллица) ───────────
 def make_confirmation_pdf(filename: str, user, status: str, ts: str) -> str:
     c = canvas.Canvas(filename, pagesize=A4)
     width, height = A4
@@ -114,10 +116,9 @@ def make_confirmation_pdf(filename: str, user, status: str, ts: str) -> str:
     c.save()
     return filename
 
-# ── Хэндлеры бота ─────────────────────────────────────────
-@router.message(CommandStart())
-async def start(m: Message):
-    kb = types.InlineKeyboardMarkup(inline_keyboard=[
+# ───────────────────────── БОТ ───────────────────────────
+def start_keyboard():
+    return types.InlineKeyboardMarkup(inline_keyboard=[
         [
             types.InlineKeyboardButton(text="📄 Политика (PDF)", callback_data="policy_pdf"),
             types.InlineKeyboardButton(text="📝 Согласие (PDF)", callback_data="consent_pdf"),
@@ -127,9 +128,12 @@ async def start(m: Message):
             types.InlineKeyboardButton(text="❌ Не согласен", callback_data="disagree"),
         ],
     ])
+
+@router.message(CommandStart())
+async def start(m: Message):
     await m.answer(
         "Здравствуйте! Ознакомьтесь с документами (PDF), затем нажмите «✅ Согласен» или «❌ Не согласен».",
-        reply_markup=kb
+        reply_markup=start_keyboard()
     )
 
 @router.message(Command("ping"))
@@ -141,7 +145,9 @@ async def send_policy_pdf(c: CallbackQuery):
     if not os.path.exists(POLICY_PDF):
         await c.answer("Файл policy.pdf не найден рядом с ботом.", show_alert=True)
         return
-    await c.message.answer_document(FSInputFile(POLICY_PDF), caption="Политика конфиденциальности (PDF)")
+    # ломаем кэш Телеграма: новое имя файла на лету
+    f = FSInputFile(POLICY_PDF, filename=f"policy_{int(time.time())}.pdf")
+    await c.message.answer_document(f, caption="Политика конфиденциальности (PDF)")
     await c.answer()
 
 @router.callback_query(F.data == "consent_pdf")
@@ -149,7 +155,8 @@ async def send_consent_pdf(c: CallbackQuery):
     if not os.path.exists(CONSENT_PDF):
         await c.answer("Файл consent.pdf не найден рядом с ботом.", show_alert=True)
         return
-    await c.message.answer_document(FSInputFile(CONSENT_PDF), caption="Текст согласия (PDF)")
+    f = FSInputFile(CONSENT_PDF, filename=f"consent_{int(time.time())}.pdf")
+    await c.message.answer_document(f, caption="Текст согласия (PDF)")
     await c.answer()
 
 @router.callback_query(F.data.in_({"agree", "disagree"}))
@@ -160,7 +167,7 @@ async def consent_handler(c: CallbackQuery):
 
     existing_status = get_user_status(EXCEL_FILE, user.id)
 
-    # 🔒 Защита от повторных ответов
+    # защита от повторов
     if existing_status == "Согласен":
         await c.answer("Ваш выбор уже зафиксирован: Согласен. Изменить нельзя.", show_alert=True)
         return
@@ -170,10 +177,10 @@ async def consent_handler(c: CallbackQuery):
     elif existing_status == "Не согласен" and status == "Согласен":
         pass  # разрешаем согласиться после отказа
 
-    # Запись в Excel
+    # запись в Excel
     append_excel_entry(EXCEL_FILE, ts, user, status)
 
-    # 📢 Уведомление админу
+    # уведомление админу
     try:
         text = (f"Новый ответ!\n"
                 f"ID: {user.id}\n"
@@ -185,14 +192,15 @@ async def consent_handler(c: CallbackQuery):
     except Exception as e:
         logging.warning(f"Не удалось отправить уведомление админу: {e}")
 
-    # Ответ пользователю
+    # ответ пользователю
     if status == "Согласен":
         pdf_name = f"Подтверждение_{user.id}.pdf"
         make_confirmation_pdf(pdf_name, user, status, ts)
         await c.message.edit_text("Спасибо! Ваш выбор зафиксирован: Согласен")
-        await c.message.answer_document(FSInputFile(pdf_name), caption="Ваше подтверждение (PDF)")
+        await c.message.answer_document(FSInputFile(pdf_name, filename=f"confirm_{int(time.time())}.pdf"),
+                                        caption="Ваше подтверждение (PDF)")
         try:
-            os.remove(pdf_name)
+            os.remove(pdf_name)  # удаляем временный файл
         except Exception:
             pass
     else:
@@ -208,7 +216,17 @@ async def send_report(m: Message):
     if not os.path.exists(EXCEL_FILE):
         await m.answer("Файл consents.xlsx ещё не создан")
         return
-    await m.answer_document(FSInputFile(EXCEL_FILE), caption="📊 Отчёт по согласиям")
+
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    temp_name = f"consents_{ts}.xlsx"
+    shutil.copy(EXCEL_FILE, temp_name)
+
+    await m.answer_document(FSInputFile(temp_name), caption="📊 Отчёт по согласиям")
+
+    try:
+        os.remove(temp_name)
+    except Exception:
+        pass
 
 @router.message(Command("help"))
 async def help_cmd(m: Message):
@@ -216,13 +234,17 @@ async def help_cmd(m: Message):
         "Команды:\n"
         "• /start — показать кнопки\n"
         "• /ping — проверить, что бот жив\n"
-        "• 📄 Политика — отправляет policy.pdf\n"
-        "• 📝 Согласие — отправляет consent.pdf\n"
-        "• ✅/❌ — зафиксировать выбор (повторное изменение запрещено)\n"
         "• /report — админ получает consents.xlsx\n"
     )
 
-# ── HTTP-сервер для Render Free ───────────────────────────
+@router.message()
+async def any_message(m: Message):
+    await m.answer(
+        "Здравствуйте! Для начала работы нажмите «📄/📝» или выберите «✅/❌».\nТакже доступна команда /start.",
+        reply_markup=start_keyboard()
+    )
+
+# ─────────────── HTTP-сервер для Render ───────────────
 async def health(request):
     return web.Response(text="ok")
 
@@ -237,19 +259,16 @@ async def run_http_server():
     site = web.TCPSite(runner, host="0.0.0.0", port=port)
     await site.start()
 
-    # держим сервер живым
     await asyncio.Event().wait()
 
-# ── Запуск бота ───────────────────────────────────────────
+# ───────────────────────── Запуск ─────────────────────────
 async def run_bot():
     bot = Bot(TOKEN)
     dp = Dispatcher()
     dp.include_router(router)
-    # удаляем возможный webhook, чтобы polling не конфликтовал
     await bot.delete_webhook(drop_pending_updates=True)
     await dp.start_polling(bot)
 
-# ── Общий запуск: HTTP + Bot параллельно ──────────────────
 async def main():
     await asyncio.gather(
         run_http_server(),
@@ -258,4 +277,3 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
-
