@@ -1,4 +1,5 @@
 # main.py
+import asyncio
 import os
 import logging
 from datetime import datetime
@@ -218,15 +219,15 @@ async def on_shutdown(_app: web.Application):
         pass
 
 async def handle(request: web.Request):
-    # Получаем JSON от Telegram и передаём апдейт в диспетчер (aiogram 3)
     try:
         data = await request.json()
     except Exception:
         return web.Response(status=400, text="no json")
+
     try:
         update = Update.model_validate(data)  # pydantic v2
-        await dp.feed_update(bot, update)
-        return web.Response(text="ok")
+        asyncio.create_task(dp.feed_update(bot, update))  # не ждём
+        return web.Response(text="ok")  # мгновенный ответ Telegram
     except Exception:
         logger.exception("Ошибка обработки апдейта")
         return web.Response(status=500, text="error")
@@ -254,3 +255,4 @@ if __name__ == "__main__":
     app = create_app()
     port = int(os.environ.get("PORT", 10000))
     web.run_app(app, host="0.0.0.0", port=port)
+
