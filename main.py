@@ -1,30 +1,30 @@
+# main.py
+import asyncio
 import os
 import logging
-import asyncio
 from datetime import datetime
 from textwrap import wrap
 from aiohttp import web
 
-from aiogram import Bot, Dispatcher, types, F
+from aiogram import Bot, Dispatcher, Router, types, F
 from aiogram.filters import CommandStart, Command
 from aiogram.types import Message, CallbackQuery, FSInputFile, Update
 
-from reportlab.pdfgen import canvas
-from reportlab.lib.pagesizes import A4
 from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
+from reportlab.lib.pagesizes import A4
+from reportlab.pdfgen import canvas
 
 from openpyxl import Workbook, load_workbook
 from openpyxl.utils import get_column_letter
 
-# ---------- Логирование ----------
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# ---------- Настройки (ENV) ----------
-TOKEN = os.environ.get("TELEGRAM_TOKEN")
-ADMIN_IDS = [int(x) for x in os.environ.get("ADMIN_IDS", "1227847495,5791748471").split(",")]
-WEBHOOK_URL = os.environ.get("WEBHOOK_URL")  # https://<project>.onrender.com/webhook/<BOT_ID>
+# ---------- Настройки ----------
+TOKEN = os.environ.get("TELEGRAM_TOKEN", "...")
+ADMIN_IDS = {1227847495, 5791748471}
+WEBHOOK_URL = os.environ.get("WEBHOOK_URL")  # пример: https://telegram-bot.onrender.com/webhook/12345
 BOT_ID_PREFIX = TOKEN.split(":")[0]
 WEBHOOK_PATH = f"/webhook/{BOT_ID_PREFIX}"
 
@@ -32,9 +32,16 @@ POLICY_PDF = "policy.pdf"
 CONSENT_PDF = "consent2.pdf"
 EXCEL_FILE = "consents.xlsx"
 
-# ---------- Aiogram ----------
-bot = Bot(TOKEN)
+# Шрифты (для кириллицы в PDF)
+pdfmetrics.registerFont(TTFont("DejaVu", "DejaVuSans.ttf"))
+pdfmetrics.registerFont(TTFont("DejaVu-Bold", "DejaVuSans-Bold.ttf"))
+
+# ---------- aiogram v3 ----------
+router = Router()
 dp = Dispatcher()
+dp.include_router(router)
+bot = Bot(TOKEN)
+
 
 # ---------- Excel ----------
 def init_excel_if_needed(path: str):
@@ -48,6 +55,8 @@ def init_excel_if_needed(path: str):
     for i, w in enumerate(widths, start=1):
         ws.column_dimensions[get_column_letter(i)].width = w
     wb.save(path)
+    wb.close()
+
 
 def read_last_status_for_user(path: str, user_id: int):
     if not os.path.exists(path):
@@ -57,11 +66,14 @@ def read_last_status_for_user(path: str, user_id: int):
     last = None
     for row in ws.iter_rows(min_row=2, values_only=True):
         try:
-            if int(row[1]) == user_id:
-                last = row[5]
+            uid = int(row[1])
         except Exception:
             continue
+        if uid == user_id:
+            last = row[5]
+    wb.close()
     return last
+
 
 def append_excel_entry(path: str, ts: str, user, status: str):
     init_excel_if_needed(path)
@@ -69,149 +81,192 @@ def append_excel_entry(path: str, ts: str, user, status: str):
     ws = wb.active
     ws.append([ts, user.id, user.username or "", user.first_name or "", user.last_name or "", status])
     wb.save(path)
+    wb.close()
 
-def clear_excel(path: str):
-    wb = Workbook()
-    ws = wb.active
-    ws.title = "Consents"
-    ws.append(["Timestamp", "User ID", "Username", "First name", "Last name", "Status"])
-    widths = [20, 15, 25, 20, 20, 15]
-    for i, w in enumerate(widths, start=1):
-        ws.column_dimensions[get_column_letter(i)].width = w
-    wb.save(path)
 
 # ---------- PDF ----------
-pdfmetrics.registerFont(TTFont("DejaVu", "DejaVuSans.ttf"))
-pdfmetrics.registerFont(TTFont("DejaVu-Bold", "DejaVuSans-Bold.ttf"))
-
 def make_confirmation_pdf(filename: str, user, status: str, ts: str) -> str:
     c = canvas.Canvas(filename, pagesize=A4)
+    c.setFont("DejaVu-Bold", 14)
     width, height = A4
     y = height - 40
-    c.setFont("DejaVu-Bold", 14)
-    c.drawString(40, y, "Подтверждение согласия")
+    c.drawString(40, y, "Подтверждение выбора по согласию на обработку ПДн")
+
     y -= 26
     c.setFont("DejaVu", 11)
     header = [
         f"Выбор: {status}",
         f"Дата и время: {ts}",
-        f"Telegram: @{user.username}" if user.username else f"ID: {user.id}",
+        f"Telegram: @{user.username}" if user.username else f"Telegram user_id: {user.id}",
         f"ФИО: {(user.first_name or '')} {(user.last_name or '')}".strip(),
-        f"Документы: {POLICY_PDF}, {CONSENT_PDF}"
+        f"Документы: {POLICY_PDF} / {CONSENT_PDF}"
     ]
     for hl in header:
-        for line in wrap(hl, 100):
+        for line in wrap(hl, 90):
             c.drawString(40, y, line)
             y -= 16
-    y -= 8
-    text = "Настоящим подтверждается выбор пользователя в электронном виде."
-    for line in wrap(text, 100):
+
+    body = (
+        "Настоящим подтверждается волеизъявление пользователя в электронном виде. "
+        "Содержание согласия и политики конфиденциальности предоставлено пользователю в PDF."
+    )
+    for line in wrap(body, 90):
+        if y < 60:
+            c.showPage()
+            c.setFont("DejaVu", 11)
+            y = height - 40
         c.drawString(40, y, line)
         y -= 16
+
     c.save()
     return filename
 
+
 # ---------- Хэндлеры ----------
-@dp.message(CommandStart())
-async def cmd_start(m: Message):
+@router.message(CommandStart())
+async def start(m: Message):
     kb = types.InlineKeyboardMarkup(inline_keyboard=[
         [types.InlineKeyboardButton(text="📄 Политика", callback_data="policy_pdf"),
          types.InlineKeyboardButton(text="📝 Согласие", callback_data="consent_pdf")],
         [types.InlineKeyboardButton(text="✅ Согласен", callback_data="agree"),
          types.InlineKeyboardButton(text="❌ Не согласен", callback_data="disagree")]
     ])
-    await m.answer("Здравствуйте! Ознакомьтесь с документами и выберите действие:", reply_markup=kb)
+    await m.answer("Здравствуйте! Ознакомьтесь с документами (PDF), затем выберите действие:", reply_markup=kb)
 
-@dp.message(Command("ping"))
-async def cmd_ping(m: Message):
-    await m.answer("pong")
 
-@dp.message(Command("id"))
-async def cmd_id(m: Message):
+@router.message(Command("id"))
+async def whoami(m: Message):
     await m.answer(f"Ваш ID: {m.from_user.id}")
 
-@dp.callback_query(F.data == "policy_pdf")
-async def send_policy(c: CallbackQuery):
+
+@router.message(Command("ping"))
+async def ping(m: Message):
+    await m.answer("pong")
+
+
+@router.callback_query(F.data == "policy_pdf")
+async def send_policy_pdf(c: CallbackQuery):
+    if not os.path.exists(POLICY_PDF):
+        await c.answer("Файл policy.pdf не найден.", show_alert=True)
+        return
     await c.message.answer_document(FSInputFile(POLICY_PDF), caption="Политика конфиденциальности")
     await c.answer()
 
-@dp.callback_query(F.data == "consent_pdf")
-async def send_consent(c: CallbackQuery):
+
+@router.callback_query(F.data == "consent_pdf")
+async def send_consent_pdf(c: CallbackQuery):
+    if not os.path.exists(CONSENT_PDF):
+        await c.answer(f"Файл {CONSENT_PDF} не найден.", show_alert=True)
+        return
     await c.message.answer_document(FSInputFile(CONSENT_PDF), caption="Текст согласия")
     await c.answer()
 
-@dp.callback_query(F.data.in_({"agree", "disagree"}))
+
+@router.callback_query(F.data.in_({"agree", "disagree"}))
 async def consent_handler(c: CallbackQuery):
-    user, action = c.from_user, c.data
-    status = "Согласен" if action == "agree" else "Не согласен"
+    user = c.from_user
+    status = "Согласен" if c.data == "agree" else "Не согласен"
     ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
     last = read_last_status_for_user(EXCEL_FILE, user.id)
     if last == status:
-        await c.answer(f"Ваш выбор уже зафиксирован: {status}", show_alert=True)
+        await c.answer(f"Ваш выбор уже зафиксирован: {status}.", show_alert=True)
         return
 
     append_excel_entry(EXCEL_FILE, ts, user, status)
 
     if status == "Согласен":
         tmp_pdf = f"confirmation_{user.id}.pdf"
-        make_confirmation_pdf(tmp_pdf, user, status, ts)
-        await c.message.answer_document(FSInputFile(tmp_pdf), caption="Подтверждение (PDF)")
-        os.remove(tmp_pdf)
-
-    await c.message.answer(f"Ваш выбор зафиксирован: {status}")
-    await c.answer()
-
-    # Уведомляем админов
-    for admin in ADMIN_IDS:
         try:
-            await bot.send_message(admin, f"📢 {user.full_name} ({user.id}) выбрал: {status}")
+            make_confirmation_pdf(tmp_pdf, user, status, ts)
+            await c.message.edit_text(f"Спасибо! Ваш выбор зафиксирован: {status}")
+            await c.message.answer_document(FSInputFile(tmp_pdf), caption="Подтверждение (PDF)")
+        finally:
+            if os.path.exists(tmp_pdf):
+                os.remove(tmp_pdf)
+    else:
+        await c.message.edit_text("Отказ зафиксирован.")
+
+    # уведомить админов
+    for admin_id in ADMIN_IDS:
+        try:
+            await bot.send_message(admin_id, f"📢 {user.full_name} ({user.id}) выбрал: {status}")
         except Exception:
             pass
 
-@dp.message(Command("report"))
-async def cmd_report(m: Message):
+    await c.answer()
+
+
+@router.message(Command("report"))
+async def report_cmd(m: Message):
     if m.from_user.id not in ADMIN_IDS:
-        await m.answer("⛔ Только для администратора")
+        await m.answer("Команда доступна только администратору.")
         return
     if not os.path.exists(EXCEL_FILE):
-        await m.answer("Файл ещё не создан")
+        await m.answer("Отчёт пуст (файл не найден).")
         return
     await m.answer_document(FSInputFile(EXCEL_FILE), caption="Отчёт по согласиям")
 
-@dp.message(Command("clear"))
-async def cmd_clear(m: Message):
+
+@router.message(Command("clear"))
+async def clear_cmd(m: Message):
     if m.from_user.id not in ADMIN_IDS:
-        await m.answer("⛔ Только для администратора")
+        await m.answer("Команда доступна только администратору.")
         return
-    clear_excel(EXCEL_FILE)
+    if os.path.exists(EXCEL_FILE):
+        os.remove(EXCEL_FILE)
     await m.answer("Отчёт очищен ✅")
 
-@dp.message(Command("help"))
-async def cmd_help(m: Message):
-    await m.answer("/start /ping /id /report /clear /help")
+
+# ---------- Ошибки ----------
+@dp.errors()
+async def errors_handler(update, exception):
+    logger.exception("Global error: %s", exception)
+    return True
+
 
 # ---------- Webhook ----------
-async def on_startup(app: web.Application):
-    await bot.set_webhook(WEBHOOK_URL, drop_pending_updates=True)
-    logger.info("Webhook установлен: %s", WEBHOOK_URL)
+async def on_startup(_app: web.Application):
+    try:
+        await bot.set_webhook(WEBHOOK_URL, drop_pending_updates=True)
+        logger.info("Webhook установлен: %s", WEBHOOK_URL)
+    except Exception:
+        logger.exception("Не удалось установить webhook")
 
-async def on_shutdown(app: web.Application):
-    await bot.delete_webhook()
+
+async def on_shutdown(_app: web.Application):
+    try:
+        await bot.delete_webhook(drop_pending_updates=True)
+        logger.info("Webhook удалён")
+    except Exception:
+        pass
     await bot.session.close()
-    logger.info("Webhook удалён")
+
 
 async def handle(request: web.Request):
-    data = await request.json()
-    update = Update.model_validate(data)
-    await dp.feed_update(bot, update)
+    try:
+        data = await request.json()
+        update = Update.model_validate(data)
+    except Exception:
+        return web.Response(status=400, text="no json")
+
+    async def process():
+        try:
+            await dp.feed_update(bot, update)
+        except Exception as e:
+            logger.exception("Ошибка обработки апдейта: %s", e)
+
+    asyncio.create_task(process())
     return web.Response(text="ok")
+
 
 async def root(_):
     return web.Response(text="ok")
 
+
 async def healthz(_):
     return web.Response(text="ok")
+
 
 def create_app():
     app = web.Application()
@@ -222,8 +277,11 @@ def create_app():
     app.on_cleanup.append(on_shutdown)
     return app
 
+
 if __name__ == "__main__":
     if not WEBHOOK_URL:
-        logger.error("WEBHOOK_URL не задан")
+        logger.error("WEBHOOK_URL не задан.")
         raise SystemExit(1)
-    web.run_app(create_app(), host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
+    app = create_app()
+    port = int(os.environ.get("PORT", 10000))
+    web.run_app(app, host="0.0.0.0", port=port)
