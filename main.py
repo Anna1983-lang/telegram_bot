@@ -4,7 +4,8 @@ import os
 import logging
 from datetime import datetime
 from textwrap import wrap
-from aiohttp import web
+from typing import List, Optional, Tuple
+from aiohttp import web, ClientSession
 
 from aiogram import Bot, Dispatcher, Router, types, F
 from aiogram.filters import CommandStart, Command
@@ -19,10 +20,15 @@ from openpyxl.utils import get_column_letter
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# ---------- Настройки (ENV) ----------
+# ---------- ENV / SETTINGS ----------
 TOKEN = os.environ.get("TELEGRAM_TOKEN", "8475192387:AAESFlpUUqJzlqPTQkcAv1sDVeZJSFOQV0w")
-ADMIN_ID = int(os.environ.get("ADMIN_ID", "1227847495"))
-WEBHOOK_URL = os.environ.get("WEBHOOK_URL")  # пример: https://telegram-bot-aum2.onrender.com/webhook/8475192387
+
+# несколько админов через запятую (ENV: ADMIN_IDS="1227847495,5791748471")
+ADMIN_IDS = {
+    int(x) for x in os.environ.get("ADMIN_IDS", "1227847495,5791748471").replace(" ", "").split(",") if x
+}
+
+WEBHOOK_URL = os.environ.get("WEBHOOK_URL")  # например: https://telegram-bot-aum2.onrender.com/webhook/8475192387
 BOT_ID_PREFIX = TOKEN.split(":")[0]
 WEBHOOK_PATH = f"/webhook/{BOT_ID_PREFIX}"
 
@@ -36,7 +42,7 @@ dp = Dispatcher()
 dp.include_router(router)
 bot = Bot(TOKEN)
 
-# ---------- Excel/PDF утилиты ----------
+# ---------- Excel утилиты ----------
 def init_excel_if_needed(path: str):
     if os.path.exists(path):
         return
@@ -49,13 +55,21 @@ def init_excel_if_needed(path: str):
         ws.column_dimensions[get_column_letter(i)].width = w
     wb.save(path)
 
-def read_last_status_for_user(path: str, user_id: int):
+def read_all_rows(path: str):
     if not os.path.exists(path):
-        return None
+        return []
     wb = load_workbook(path, read_only=True)
     ws = wb.active
+    rows = []
+    for i, row in enumerate(ws.iter_rows(values_only=True)):
+        if i == 0:
+            continue  # пропускаем заголовок
+        rows.append(row)  # (ts, user_id, username, first_name, last_name, status)
+    return rows
+
+def read_last_status_for_user(path: str, user_id: int) -> Optional[str]:
     last = None
-    for row in ws.iter_rows(min_row=2, values_only=True):
+    for row in read_all_rows(path):
         try:
             uid = int(row[1])
         except Exception:
@@ -71,6 +85,73 @@ def append_excel_entry(path: str, ts: str, user, status: str):
     ws.append([ts, user.id, user.username or "", user.first_name or "", user.last_name or "", status])
     wb.save(path)
 
+def rewrite_excel(path: str, rows: List[tuple]):
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Consents"
+    ws.append(["Timestamp", "User ID", "Username", "First name", "Last name", "Status"])
+    widths = [20, 15, 25, 20, 20, 15]
+    for i, w in enumerate(widths, start=1):
+        ws.column_dimensions[get_column_letter(i)].width = w
+    for r in rows:
+        ws.append(list(r))
+    wb.save(path)
+
+def filter_rows_by_period(rows: List[tuple], start: Optional[datetime], end: Optional[datetime]) -> List[tuple]:
+    if not start and not end:
+        return rows
+    out = []
+    for r in rows:
+        try:
+            ts = datetime.strptime(str(r[0]), "%Y-%m-%d %H:%M:%S")
+        except Exception:
+            # на всякий случай пробуем ISO
+            try:
+                ts = datetime.fromisoformat(str(r[0]))
+            except Exception:
+                continue
+        if start and ts < start:
+            continue
+        if end and ts > end:
+            continue
+        out.append(r)
+    return out
+
+def parse_period(text_after_command: str) -> Tuple[Optional[datetime], Optional[datetime]]:
+    """
+    Поддерживает:
+      ''                              -> весь период
+      '2025-08-25'                    -> за день
+      '2025-08-01 00:00 2025-08-31 23:59' -> произвольный интервал
+    """
+    s = text_after_command.strip()
+    if not s:
+        return None, None
+    parts = s.split()
+    fmt_date = "%Y-%m-%d"
+    fmt_dt = "%Y-%m-%d %H:%M"
+    try:
+        if len(parts) == 1:
+            start = datetime.strptime(parts[0], fmt_date)
+            end = datetime.strptime(parts[0], fmt_date).replace(hour=23, minute=59, second=59)
+            return start, end
+        elif len(parts) >= 2:
+            # пробуем с временами
+            try:
+                start = datetime.strptime(" ".join(parts[0:2]), fmt_dt)
+                if len(parts) >= 4:
+                    end = datetime.strptime(" ".join(parts[2:4]), fmt_dt)
+                else:
+                    end = None
+            except ValueError:
+                # попробуем как две даты
+                start = datetime.strptime(parts[0], fmt_date)
+                end = datetime.strptime(parts[1], fmt_date).replace(hour=23, minute=59, second=59)
+            return start, end
+    except Exception:
+        return None, None
+
+# ---------- PDF ----------
 def make_confirmation_pdf(filename: str, user, status: str, ts: str) -> str:
     c = canvas.Canvas(filename, pagesize=A4)
     width, height = A4
@@ -155,6 +236,17 @@ async def consent_handler(c: CallbackQuery):
 
     append_excel_entry(EXCEL_FILE, ts, user, status)
 
+    # Уведомление всем админам
+    text = (f"🆕 Новый выбор по согласию\n"
+            f"Статус: {status}\n"
+            f"Время: {ts}\n"
+            f"User: {user.id} @{user.username or '—'} {user.first_name or ''} {user.last_name or ''}".strip())
+    for admin_id in ADMIN_IDS:
+        try:
+            await bot.send_message(admin_id, text)
+        except Exception:
+            logger.exception("Не удалось отправить уведомление админу %s", admin_id)
+
     if status == "Согласен":
         tmp_pdf = f"confirmation_{user.id}.pdf"
         try:
@@ -174,37 +266,100 @@ async def consent_handler(c: CallbackQuery):
         await c.message.edit_text("Отказ зафиксирован. Если передумаете — отправьте /start и согласуйте заново.")
     await c.answer()
 
-@router.message(Command("help"))
+@router.message(Command("help")))
 async def help_cmd(m: Message):
-    await m.answer("Команды:\n• /start\n• /id\n• /ping\n• /report — отправка Excel-отчёта (только администратору)")
+    await m.answer(
+        "Команды:\n"
+        "• /start\n"
+        "• /id\n"
+        "• /ping\n"
+        "• /report [YYYY-MM-DD] | [YYYY-MM-DD HH:MM YYYY-MM-DD HH:MM]\n"
+        "• /clear_all — очистить все записи (админ)\n"
+        "• /clear_user <user_id> — удалить записи пользователя (админ)"
+    )
+
+def is_admin(user_id: int) -> bool:
+    return user_id in ADMIN_IDS
 
 @router.message(Command("report"))
 async def report_cmd(m: Message):
-    if m.from_user.id != ADMIN_ID:
+    if not is_admin(m.from_user.id):
         await m.answer("Команда доступна только администратору.")
         return
     if not os.path.exists(EXCEL_FILE):
         await m.answer("Отчёт пока пуст (файл не найден).")
         return
-    try:
-        await m.answer_document(FSInputFile(EXCEL_FILE), caption="Отчёт по согласиям (Excel)")
-    except Exception as e:
-        logger.exception("Не удалось отправить Excel: %s", e)
-        await m.answer("Ошибка при отправке отчёта. Проверьте логи.")
 
-# ---------- Webhook HTTP сервер (aiohttp) ----------
+    # разбор периода
+    text_after = m.text.split(" ", 1)[1] if " " in m.text else ""
+    start, end = parse_period(text_after)
+
+    rows = read_all_rows(EXCEL_FILE)
+    rows = filter_rows_by_period(rows, start, end)
+
+    if not rows:
+        await m.answer("За указанный период записей нет.")
+        return
+
+    # сформируем временный Excel с отфильтрованными строками
+    try:
+        tmp = "report_filtered.xlsx"
+        rewrite_excel(tmp, rows)
+        caption = "Отчёт по согласиям"
+        if start or end:
+            caption += f" (фильтр: {start or '…'} — {end or '…'})"
+        await m.answer_document(FSInputFile(tmp), caption=caption)
+    except Exception:
+        logger.exception("Не удалось сформировать/отправить Excel")
+        await m.answer("Ошибка при формировании отчёта. Проверьте логи.")
+    finally:
+        try:
+            if os.path.exists(tmp):
+                os.remove(tmp)
+        except Exception:
+            pass
+
+@router.message(Command("clear_all"))
+async def clear_all_cmd(m: Message):
+    if not is_admin(m.from_user.id):
+        await m.answer("Команда доступна только администратору.")
+        return
+    rewrite_excel(EXCEL_FILE, [])
+    await m.answer("Все записи очищены.")
+
+@router.message(Command("clear_user"))
+async def clear_user_cmd(m: Message):
+    if not is_admin(m.from_user.id):
+        await m.answer("Команда доступна только администратору.")
+        return
+    parts = m.text.strip().split()
+    if len(parts) < 2 or not parts[1].isdigit():
+        await m.answer("Использование: /clear_user <user_id>")
+        return
+    target = int(parts[1])
+    rows = read_all_rows(EXCEL_FILE)
+    new_rows = [r for r in rows if int(r[1]) != target]
+    rewrite_excel(EXCEL_FILE, new_rows)
+    await m.answer(f"Записи пользователя {target} удалены ({len(rows) - len(new_rows)} шт.).")
+
+# ---------- Webhook / сервер ----------
 async def on_startup(_app: web.Application):
     if not WEBHOOK_URL:
-        logger.error("WEBHOOK_URL не задан (ENV). Установи WEBHOOK_URL в Render.")
+        logger.error("WEBHOOK_URL не задан (ENV). Установите WEBHOOK_URL в Render.")
         return
     try:
         me = await bot.get_me()
-        logger.info("Bot started as @%s (id=%s). ADMIN_ID=%s", me.username, me.id, ADMIN_ID)
-        # сбрасываем хвост апдейтов и ставим вебхук
+        logger.info("Bot @%s (id=%s). ADMIN_IDS=%s", me.username, me.id, ADMIN_IDS)
         await bot.set_webhook(WEBHOOK_URL, drop_pending_updates=True)
         logger.info("Webhook установлен: %s", WEBHOOK_URL)
     except Exception:
         logger.exception("Не удалось установить webhook")
+
+    # фоновая будилка: self-ping /healthz
+    try:
+        asyncio.create_task(_keepalive_task())
+    except Exception:
+        logger.exception("Не удалось запустить keepalive")
 
 async def on_shutdown(_app: web.Application):
     try:
@@ -212,47 +367,57 @@ async def on_shutdown(_app: web.Application):
         logger.info("Webhook удалён")
     except Exception:
         logger.exception("Не удалось удалить webhook")
-    # Важно: закрыть HTTP-сессию, чтобы не было warnings "Unclosed client session"
     try:
         await bot.session.close()
     except Exception:
         pass
+
+async def _keepalive_task():
+    if not WEBHOOK_URL:
+        return
+    base = WEBHOOK_URL.split("/webhook")[0]
+    url = base + "/healthz"
+    while True:
+        try:
+            async with ClientSession() as s:
+                async with s.get(url, timeout=5) as r:
+                    await r.text()
+        except Exception:
+            pass
+        await asyncio.sleep(240)  # каждые ~4 минуты
 
 async def handle(request: web.Request):
     try:
         data = await request.json()
     except Exception:
         return web.Response(status=400, text="no json")
-
     try:
         update = Update.model_validate(data)  # pydantic v2
-        asyncio.create_task(dp.feed_update(bot, update))  # не ждём
-        return web.Response(text="ok")  # мгновенный ответ Telegram
+        asyncio.create_task(dp.feed_update(bot, update))  # не ждём — сразу 200 OK
+        return web.Response(text="ok")
     except Exception:
         logger.exception("Ошибка обработки апдейта")
         return web.Response(status=500, text="error")
 
-# Доп. эндпоинты для здоровья
 async def root(_request: web.Request):
     return web.Response(text="ok")
+
 async def healthz(_request: web.Request):
     return web.Response(text="ok")
 
-# ---------- Запуск приложения ----------
 def create_app():
     app = web.Application()
     app.router.add_get("/", root)
     app.router.add_get("/healthz", healthz)
-    app.router.add_post(WEBHOOK_PATH, handle)  # путь должен совпадать с WEBHOOK_URL
+    app.router.add_post(WEBHOOK_PATH, handle)
     app.on_startup.append(on_startup)
     app.on_cleanup.append(on_shutdown)
     return app
 
 if __name__ == "__main__":
     if not WEBHOOK_URL:
-        logger.error("ERROR: WEBHOOK_URL environment variable is not set. Set it to the full public webhook URL.")
+        logger.error("ERROR: WEBHOOK_URL not set.")
         raise SystemExit(1)
     app = create_app()
     port = int(os.environ.get("PORT", 10000))
     web.run_app(app, host="0.0.0.0", port=port)
-
