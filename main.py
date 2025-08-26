@@ -4,9 +4,7 @@ import os
 import logging
 from datetime import datetime
 from textwrap import wrap
-from typing import List, Optional, Tuple
-
-from aiohttp import web, ClientSession
+from aiohttp import web
 
 from aiogram import Bot, Dispatcher, Router, types, F
 from aiogram.filters import CommandStart, Command
@@ -14,44 +12,35 @@ from aiogram.types import Message, CallbackQuery, FSInputFile, Update
 
 from reportlab.lib.pagesizes import A4
 from reportlab.pdfgen import canvas
-from reportlab.pdfbase import pdfmetrics
-from reportlab.pdfbase.ttfonts import TTFont
 
 from openpyxl import Workbook, load_workbook
 from openpyxl.utils import get_column_letter
 
-# ---------- Logging ----------
-logging.basicConfig(level=logging.INFO)
+# ---------- Логирование ----------
+logging.basicConfig(level=logging.DEBUG)
 logger = logging.getLogger(__name__)
 
-# ---------- ENV / SETTINGS ----------
-TOKEN = os.environ.get("TELEGRAM_TOKEN", "")
-if not TOKEN:
-    logger.error("TELEGRAM_TOKEN not set in ENV")
+# ---------- Настройки (ENV) ----------
+TOKEN = os.environ.get("TELEGRAM_TOKEN", "8475192387:AAESFlpUUqJzlqPTQkcAv1sDVeZJSFOQV0w")
 ADMIN_IDS = {
-    int(x) for x in os.environ.get("ADMIN_IDS", "1227847495,5791748471").replace(" ", "").split(",") if x
+    int(os.environ.get("ADMIN_ID", "1227847495")),
+    5791748471
 }
-WEBHOOK_URL = os.environ.get("WEBHOOK_URL", "")  # e.g. https://your-app.onrender.com/webhook/<botid>
-BOT_ID_PREFIX = TOKEN.split(":")[0] if TOKEN else ""
+WEBHOOK_URL = os.environ.get("WEBHOOK_URL")  # пример: https://telegram-bot-aum2.onrender.com/webhook/8475192387
+BOT_ID_PREFIX = TOKEN.split(":")[0]
 WEBHOOK_PATH = f"/webhook/{BOT_ID_PREFIX}"
 
 POLICY_PDF = "policy.pdf"
 CONSENT_PDF = "consent2.pdf"
 EXCEL_FILE = "consents.xlsx"
 
-# PDF fonts (put TTF files in repo under fonts/ or set ENV)
-PDF_FONT_REGULAR_PATH = os.environ.get("PDF_FONT_REGULAR", "fonts/DejaVuSans.ttf")
-PDF_FONT_BOLD_PATH = os.environ.get("PDF_FONT_BOLD", "fonts/DejaVuSans-Bold.ttf")
-PDF_FONT_REGULAR_NAME = "DejaVuSans"
-PDF_FONT_BOLD_NAME = "DejaVuSans-Bold"
-
-# ---------- aiogram setup ----------
+# ---------- aiogram v3 ----------
 router = Router()
 dp = Dispatcher()
 dp.include_router(router)
 bot = Bot(TOKEN)
 
-# ---------- Excel helpers ----------
+# ---------- Excel/PDF утилиты ----------
 def init_excel_if_needed(path: str):
     if os.path.exists(path):
         return
@@ -64,21 +53,13 @@ def init_excel_if_needed(path: str):
         ws.column_dimensions[get_column_letter(i)].width = w
     wb.save(path)
 
-def read_all_rows(path: str) -> List[tuple]:
+def read_last_status_for_user(path: str, user_id: int):
     if not os.path.exists(path):
-        return []
+        return None
     wb = load_workbook(path, read_only=True)
     ws = wb.active
-    rows = []
-    for i, row in enumerate(ws.iter_rows(values_only=True)):
-        if i == 0:
-            continue
-        rows.append(row)
-    return rows
-
-def read_last_status_for_user(path: str, user_id: int) -> Optional[str]:
     last = None
-    for row in read_all_rows(path):
+    for row in ws.iter_rows(min_row=2, values_only=True):
         try:
             uid = int(row[1])
         except Exception:
@@ -94,89 +75,14 @@ def append_excel_entry(path: str, ts: str, user, status: str):
     ws.append([ts, user.id, user.username or "", user.first_name or "", user.last_name or "", status])
     wb.save(path)
 
-def rewrite_excel(path: str, rows: List[tuple]):
-    wb = Workbook()
-    ws = wb.active
-    ws.title = "Consents"
-    ws.append(["Timestamp", "User ID", "Username", "First name", "Last name", "Status"])
-    widths = [20, 15, 25, 20, 20, 15]
-    for i, w in enumerate(widths, start=1):
-        ws.column_dimensions[get_column_letter(i)].width = w
-    for r in rows:
-        ws.append(list(r))
-    wb.save(path)
-
-def filter_rows_by_period(rows: List[tuple], start: Optional[datetime], end: Optional[datetime]) -> List[tuple]:
-    if not start and not end:
-        return rows
-    out = []
-    for r in rows:
-        try:
-            ts = datetime.strptime(str(r[0]), "%Y-%m-%d %H:%M:%S")
-        except Exception:
-            try:
-                ts = datetime.fromisoformat(str(r[0]))
-            except Exception:
-                continue
-        if start and ts < start:
-            continue
-        if end and ts > end:
-            continue
-        out.append(r)
-    return out
-
-def parse_period(text_after_command: str) -> Tuple[Optional[datetime], Optional[datetime]]:
-    s = (text_after_command or "").strip()
-    if not s:
-        return None, None
-    parts = s.split()
-    fmt_date = "%Y-%m-%d"
-    fmt_dt = "%Y-%m-%d %H:%M"
-    try:
-        if len(parts) == 1:
-            start = datetime.strptime(parts[0], fmt_date)
-            end = datetime.strptime(parts[0], fmt_date).replace(hour=23, minute=59, second=59)
-            return start, end
-        elif len(parts) >= 2:
-            try:
-                start = datetime.strptime(" ".join(parts[0:2]), fmt_dt)
-                if len(parts) >= 4:
-                    end = datetime.strptime(" ".join(parts[2:4]), fmt_dt)
-                else:
-                    end = None
-            except ValueError:
-                start = datetime.strptime(parts[0], fmt_date)
-                end = datetime.strptime(parts[1], fmt_date).replace(hour=23, minute=59, second=59)
-            return start, end
-    except Exception:
-        return None, None
-
-# ---------- PDF with Cyrillic ----------
-def _register_pdf_fonts():
-    try:
-        registered = set(pdfmetrics.getRegisteredFontNames())
-        if PDF_FONT_REGULAR_NAME not in registered and os.path.exists(PDF_FONT_REGULAR_PATH):
-            pdfmetrics.registerFont(TTFont(PDF_FONT_REGULAR_NAME, PDF_FONT_REGULAR_PATH))
-        if PDF_FONT_BOLD_NAME not in registered and os.path.exists(PDF_FONT_BOLD_PATH):
-            pdfmetrics.registerFont(TTFont(PDF_FONT_BOLD_NAME, PDF_FONT_BOLD_PATH))
-    except Exception:
-        logger.exception("Не удалось зарегистрировать TTF-шрифты для PDF")
-
 def make_confirmation_pdf(filename: str, user, status: str, ts: str) -> str:
-    _register_pdf_fonts()
     c = canvas.Canvas(filename, pagesize=A4)
     width, height = A4
     y = height - 40
-    try:
-        c.setFont(PDF_FONT_BOLD_NAME, 14)
-    except Exception:
-        c.setFont("Helvetica-Bold", 14)
+    c.setFont("Helvetica-Bold", 14)
     c.drawString(40, y, "Подтверждение выбора по согласию на обработку ПДн")
     y -= 26
-    try:
-        c.setFont(PDF_FONT_REGULAR_NAME, 11)
-    except Exception:
-        c.setFont("Helvetica", 11)
+    c.setFont("Helvetica", 11)
     header = [
         f"Выбор: {status}",
         f"Дата и время: {ts}",
@@ -194,39 +100,14 @@ def make_confirmation_pdf(filename: str, user, status: str, ts: str) -> str:
     for line in wrap(body, 100):
         if y < 60:
             c.showPage()
-            try:
-                c.setFont(PDF_FONT_REGULAR_NAME, 11)
-            except Exception:
-                c.setFont("Helvetica", 11)
             y = height - 40
+            c.setFont("Helvetica", 11)
         c.drawString(40, y, line)
         y -= 16
     c.save()
     return filename
 
-# ---------- Async helpers (notifications/pdf) ----------
-async def _notify_admins_async(text: str):
-    for admin_id in ADMIN_IDS:
-        try:
-            await bot.send_message(admin_id, text)
-        except Exception:
-            logger.exception("Не удалось отправить уведомление админу %s", admin_id)
-
-async def _generate_and_send_confirmation(tmp_pdf: str, user, status: str, ts: str, chat_id: int):
-    try:
-        make_confirmation_pdf(tmp_pdf, user, status, ts)
-        await bot.send_document(chat_id, FSInputFile(tmp_pdf), caption="Ваше подтверждение (PDF)")
-    except Exception:
-        logger.exception("Ошибка при генерации/отправке PDF для user=%s", user.id)
-        await _notify_admins_async(f"Ошибка при генерации PDF для user {user.id}")
-    finally:
-        try:
-            if os.path.exists(tmp_pdf):
-                os.remove(tmp_pdf)
-        except Exception:
-            pass
-
-# ---------- Handlers ----------
+# ---------- Хэндлеры ----------
 @router.message(CommandStart())
 async def start(m: Message):
     kb = types.InlineKeyboardMarkup(inline_keyboard=[
@@ -263,169 +144,93 @@ async def send_consent_pdf(c: CallbackQuery):
 
 @router.callback_query(F.data.in_({"agree", "disagree"}))
 async def consent_handler(c: CallbackQuery):
+    user = c.from_user
+    action = c.data
+    status = "Согласен" if action == "agree" else "Не согласен"
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
     try:
-        user = c.from_user
-        action = c.data
-        status = "Согласен" if action == "agree" else "Не согласен"
-        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
         last = read_last_status_for_user(EXCEL_FILE, user.id)
-        if last == "Согласен" and status == "Согласен":
-            await c.answer("Ваш выбор уже зафиксирован: Согласен. Изменить нельзя.", show_alert=True)
-            return
-        if last == "Не согласен" and status == "Не согласен":
-            await c.answer("Ваш выбор уже зафиксирован: Не согласен. Изменить нельзя.", show_alert=True)
-            return
+    except Exception as e:
+        logger.exception("Ошибка чтения Excel: %s", e)
+        last = None
 
-        # Запись в Excel (быстро)
+    if last in ("Согласен", "Не согласен") and last == status:
+        await c.answer(f"Ваш выбор уже зафиксирован: {status}. Изменить нельзя.", show_alert=True)
+        return
+
+    try:
         append_excel_entry(EXCEL_FILE, ts, user, status)
+    except Exception as e:
+        logger.exception("Ошибка записи Excel: %s", e)
 
-        # Быстрый ответ пользователю
-        await c.answer("Ваш выбор зафиксирован. Пожалуйста, дождитесь подтверждения.", show_alert=False)
+    if status == "Согласен":
+        tmp_pdf = f"confirmation_{user.id}.pdf"
         try:
+            make_confirmation_pdf(tmp_pdf, user, status, ts)
             await c.message.edit_text(f"Спасибо! Ваш выбор зафиксирован: {status}")
-        except Exception:
-            logger.debug("Не удалось изменить текст сообщения в callback (возможно удалено)")
+            await c.message.answer_document(FSInputFile(tmp_pdf), caption="Ваше подтверждение (PDF)")
+        except Exception as e:
+            logger.exception("Ошибка при генерации PDF: %s", e)
+            await c.message.edit_text(f"Спасибо! Ваш выбор зафиксирован: {status} (ошибка при создании PDF).")
+        finally:
+            if os.path.exists(tmp_pdf):
+                os.remove(tmp_pdf)
+    else:
+        await c.message.edit_text("Отказ зафиксирован. Если передумаете — отправьте /start и согласуйте заново.")
 
-        # Уведомление админам в фоне
-        admin_text = (f"🆕 Новый выбор по согласию\n"
-                      f"Статус: {status}\n"
-                      f"Время: {ts}\n"
-                      f"User: {user.id} @{user.username or '—'} {user.first_name or ''} {user.last_name or ''}".strip())
-        asyncio.create_task(_notify_admins_async(admin_text))
-
-        # Если согласился — сгенерить PDF и отправить в фоне
-        if status == "Согласен":
-            tmp_pdf = f"confirmation_{user.id}.pdf"
-            chat_id = c.message.chat.id if c.message else user.id
-            asyncio.create_task(_generate_and_send_confirmation(tmp_pdf, user, status, ts, chat_id))
-    except Exception:
-        logger.exception("Unhandled exception in consent_handler")
+    # уведомляем админов
+    for admin_id in ADMIN_IDS:
         try:
-            await c.answer("Произошла ошибка. Попробуйте позже.", show_alert=True)
-        except Exception:
-            pass
+            await bot.send_message(admin_id, f"📢 Пользователь {user.id} ({user.username}) выбрал: {status}")
+        except Exception as e:
+            logger.warning("Не удалось уведомить админа %s: %s", admin_id, e)
+
+    await c.answer()
 
 @router.message(Command("help"))
 async def help_cmd(m: Message):
-    await m.answer(
-        "Команды:\n"
-        "• /start\n"
-        "• /id\n"
-        "• /ping\n"
-        "• /report [YYYY-MM-DD] | [YYYY-MM-DD HH:MM YYYY-MM-DD HH:MM]\n"
-        "• /clear_all — очистить все записи (админ)\n"
-        "• /clear_user <user_id> — удалить записи пользователя (админ)"
-    )
-
-def is_admin(user_id: int) -> bool:
-    return user_id in ADMIN_IDS
+    await m.answer("Команды:\n• /start\n• /id\n• /ping\n• /report — отправка Excel-отчёта (только админам)\n• /clear — очистить все согласия (только админам)")
 
 @router.message(Command("report"))
 async def report_cmd(m: Message):
-    if not is_admin(m.from_user.id):
+    if m.from_user.id not in ADMIN_IDS:
         await m.answer("Команда доступна только администратору.")
         return
     if not os.path.exists(EXCEL_FILE):
         await m.answer("Отчёт пока пуст (файл не найден).")
         return
+    await m.answer_document(FSInputFile(EXCEL_FILE), caption="Отчёт по согласиям (Excel)")
 
-    text_after = m.text.split(" ", 1)[1] if " " in m.text else ""
-    start, end = parse_period(text_after)
-
-    rows = read_all_rows(EXCEL_FILE)
-    rows = filter_rows_by_period(rows, start, end)
-
-    if not rows:
-        await m.answer("За указанный период записей нет.")
-        return
-
-    tmp = "report_filtered.xlsx"
-    try:
-        rewrite_excel(tmp, rows)
-        caption = "Отчёт по согласиям"
-        if start or end:
-            caption += f" (фильтр: {start or '…'} — {end or '…'})"
-        await m.answer_document(FSInputFile(tmp), caption=caption)
-    except Exception:
-        logger.exception("Не удалось сформировать/отправить Excel")
-        await m.answer("Ошибка при формировании отчёта. Проверьте логи.")
-    finally:
-        try:
-            if os.path.exists(tmp):
-                os.remove(tmp)
-        except Exception:
-            pass
-
-@router.message(Command("clear_all"))
-async def clear_all_cmd(m: Message):
-    if not is_admin(m.from_user.id):
+@router.message(Command("clear"))
+async def clear_cmd(m: Message):
+    if m.from_user.id not in ADMIN_IDS:
         await m.answer("Команда доступна только администратору.")
         return
-    rewrite_excel(EXCEL_FILE, [])
-    await m.answer("Все записи очищены.")
+    if os.path.exists(EXCEL_FILE):
+        os.remove(EXCEL_FILE)
+    init_excel_if_needed(EXCEL_FILE)
+    await m.answer("Все согласия очищены.")
 
-@router.message(Command("clear_user"))
-async def clear_user_cmd(m: Message):
-    if not is_admin(m.from_user.id):
-        await m.answer("Команда доступна только администратору.")
-        return
-    parts = m.text.strip().split()
-    if len(parts) < 2 or not parts[1].isdigit():
-        await m.answer("Использование: /clear_user <user_id>")
-        return
-    target = int(parts[1])
-    rows = read_all_rows(EXCEL_FILE)
-    new_rows = [r for r in rows if int(r[1]) != target]
-    rewrite_excel(EXCEL_FILE, new_rows)
-    await m.answer(f"Записи пользователя {target} удалены ({len(rows) - len(new_rows)} шт.).")
-
-# ---------- Webhook / server ----------
-async def _keepalive_task():
+# ---------- Webhook HTTP сервер (aiohttp) ----------
+async def on_startup(_app: web.Application):
     if not WEBHOOK_URL:
+        logger.error("WEBHOOK_URL не задан (ENV). Установи WEBHOOK_URL в Render.")
         return
-    base = WEBHOOK_URL.split("/webhook")[0]
-    url = base + "/healthz"
-    while True:
-        try:
-            async with ClientSession() as s:
-                async with s.get(url, timeout=5) as r:
-                    await r.text()
-        except Exception:
-            logger.debug("Keepalive ping failed (ignored).")
-        await asyncio.sleep(240)  # ~4 minutes
-
-async def on_startup(app: web.Application):
-    if not WEBHOOK_URL:
-        logger.error("WEBHOOK_URL not set in ENV. Webhook will not be registered.")
-    else:
-        try:
-            me = await bot.get_me()
-            logger.info("Bot @%s (id=%s). ADMIN_IDS=%s", me.username, me.id, ADMIN_IDS)
-            await bot.set_webhook(WEBHOOK_URL, drop_pending_updates=True)
-            logger.info("Webhook set to %s", WEBHOOK_URL)
-        except Exception:
-            logger.exception("Failed to set webhook")
-
-    # Start keepalive background task
     try:
-        app["keepalive_task"] = asyncio.create_task(_keepalive_task())
+        me = await bot.get_me()
+        logger.info("Bot started as @%s (id=%s). ADMIN_IDS=%s", me.username, me.id, ADMIN_IDS)
+        await bot.set_webhook(WEBHOOK_URL, drop_pending_updates=True)
+        logger.info("Webhook установлен: %s", WEBHOOK_URL)
     except Exception:
-        logger.exception("Failed to start keepalive task")
+        logger.exception("Не удалось установить webhook")
 
-async def on_shutdown(app: web.Application):
-    # Cancel keepalive
-    try:
-        task = app.get("keepalive_task")
-        if task:
-            task.cancel()
-    except Exception:
-        pass
-    # delete webhook and close bot session
+async def on_shutdown(_app: web.Application):
     try:
         await bot.delete_webhook(drop_pending_updates=True)
+        logger.info("Webhook удалён")
     except Exception:
-        logger.exception("Failed to delete webhook")
+        logger.exception("Не удалось удалить webhook")
     try:
         await bot.session.close()
     except Exception:
@@ -437,15 +242,13 @@ async def handle(request: web.Request):
     except Exception:
         return web.Response(status=400, text="no json")
 
-    logger.debug("Incoming update keys: %s", list(data.keys()))
     try:
         update = Update.model_validate(data)
-        # don't await processing here — respond 200 OK immediately
         asyncio.create_task(dp.feed_update(bot, update))
         return web.Response(text="ok")
-    except Exception:
-        logger.exception("Ошибка обработки апдейта")
-        return web.Response(status=500, text="error")
+    except Exception as e:
+        logger.exception("Ошибка обработки апдейта: %s", e)
+        return web.Response(status=200, text="error")
 
 async def root(_request: web.Request):
     return web.Response(text="ok")
@@ -453,11 +256,11 @@ async def root(_request: web.Request):
 async def healthz(_request: web.Request):
     return web.Response(text="ok")
 
+# ---------- Запуск приложения ----------
 def create_app():
     app = web.Application()
     app.router.add_get("/", root)
     app.router.add_get("/healthz", healthz)
-    # webhook path must match WEBHOOK_URL
     app.router.add_post(WEBHOOK_PATH, handle)
     app.on_startup.append(on_startup)
     app.on_cleanup.append(on_shutdown)
@@ -465,7 +268,7 @@ def create_app():
 
 if __name__ == "__main__":
     if not WEBHOOK_URL:
-        logger.error("ERROR: WEBHOOK_URL environment variable is not set.")
+        logger.error("ERROR: WEBHOOK_URL environment variable is not set. Set it to the full public webhook URL.")
         raise SystemExit(1)
     app = create_app()
     port = int(os.environ.get("PORT", 10000))
