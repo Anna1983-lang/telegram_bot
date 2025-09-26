@@ -18,7 +18,7 @@ POLICY_PDF = "policy.pdf"
 CONSENT_PDF = "consent2.pdf"
 OFFER_PDF = "ПУБЛИЧНОЕ ПРЕДЛОЖЕНИЕ (ОФЕРТА).pdf"
 EXCEL_FILE = "consents.xlsx"
-ADMIN_ID = 1227847495
+ADMINS = [1227847495, 5791748471]  # <-- список админов
 
 WEBHOOK_HOST = "https://web-production-4d0f4.up.railway.app"
 WEBHOOK_PATH = "/webhook"
@@ -26,7 +26,6 @@ WEBHOOK_URL = f"{WEBHOOK_HOST}{WEBHOOK_PATH}"
 
 logging.basicConfig(level=logging.INFO)
 
-# --- Шрифты для PDF
 pdfmetrics.registerFont(TTFont("DejaVu", "DejaVuSans.ttf"))
 pdfmetrics.registerFont(TTFont("DejaVu-Bold", "DejaVuSans-Bold.ttf"))
 
@@ -139,7 +138,9 @@ async def get_inn(m: Message, state: FSMContext, bot: Bot):
     await state.clear()
 
     admin_msg = f"{user.full_name or user.username} выбрал: согласен\nФИО: {fio}\nИНН: {inn}"
-    await bot.send_message(ADMIN_ID, admin_msg)
+    # уведомление всем админам
+    for admin_id in ADMINS:
+        await bot.send_message(admin_id, admin_msg)
 
 @router.callback_query(F.data == "disagree")
 async def consent_disagree_handler(c: CallbackQuery):
@@ -164,7 +165,7 @@ async def consent_disagree_handler(c: CallbackQuery):
 
 @router.message(Command("report"))
 async def report(m: Message):
-    if m.from_user.id != ADMIN_ID:
+    if m.from_user.id not in ADMINS:
         await m.answer("⛔ У вас нет доступа")
         return
     if not os.path.exists(EXCEL_FILE):
