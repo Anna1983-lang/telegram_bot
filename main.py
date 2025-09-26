@@ -16,6 +16,7 @@ from reportlab.pdfbase.ttfonts import TTFont
 TOKEN = "8475192387:AAESFlpUUqJzlqPTQkcAv1sDVeZJSFOQV0w"
 POLICY_PDF = "policy.pdf"
 CONSENT_PDF = "consent2.pdf"
+OFFER_PDF = "ПУБЛИЧНОЕ ПРЕДЛОЖЕНИЕ (ОФЕРТА).pdf"
 EXCEL_FILE = "consents.xlsx"
 ADMIN_ID = 1227847495
 
@@ -31,13 +32,9 @@ pdfmetrics.registerFont(TTFont("DejaVu-Bold", "DejaVuSans-Bold.ttf"))
 
 router = Router()
 
-AGREEMENT_TEXT = """
-🔒 Согласие на обработку персональных данных
-
-Нажимая «Согласен», вы подтверждаете, что даёте согласие
-на обработку ваших персональных данных в соответствии
-с политикой конфиденциальности.
-"""
+AGREEMENT_TEXT = (
+    "Здравствуйте! Ознакомьтесь с документами (PDF), затем выберите действие:"
+)
 
 class ConsentStates(StatesGroup):
     waiting_fio = State()
@@ -45,11 +42,44 @@ class ConsentStates(StatesGroup):
 
 @router.message(CommandStart())
 async def start_handler(m: Message):
-    kb = [[
-        {"text": "✅ Согласен", "callback_data": "agree"},
-        {"text": "❌ Не согласен", "callback_data": "disagree"}
-    ]]
-    await m.answer(AGREEMENT_TEXT, reply_markup={"inline_keyboard": kb})
+    kb = [
+        [
+            {"text": "📄 Политика (PDF)", "callback_data": "policy_pdf"},
+            {"text": "📝 Согласие (PDF)", "callback_data": "consent_pdf"}
+        ],
+        [
+            {"text": "📜 Оферта (PDF)", "callback_data": "offer_pdf"}
+        ],
+        [
+            {"text": "✅ Согласен", "callback_data": "agree"},
+            {"text": "❌ Не согласен", "callback_data": "disagree"}
+        ]
+    ]
+    await m.answer(
+        AGREEMENT_TEXT,
+        reply_markup={"inline_keyboard": kb}
+    )
+
+@router.callback_query(F.data == "policy_pdf")
+async def send_policy(c: CallbackQuery):
+    await c.message.answer_document(
+        FSInputFile(POLICY_PDF),
+        caption="Политика конфиденциальности"
+    )
+
+@router.callback_query(F.data == "consent_pdf")
+async def send_consent(c: CallbackQuery):
+    await c.message.answer_document(
+        FSInputFile(CONSENT_PDF),
+        caption="Текст согласия"
+    )
+
+@router.callback_query(F.data == "offer_pdf")
+async def send_offer(c: CallbackQuery):
+    await c.message.answer_document(
+        FSInputFile(OFFER_PDF),
+        caption="Публичное предложение (ОФЕРТА)"
+    )
 
 @router.callback_query(F.data == "agree")
 async def consent_agree_handler(c: CallbackQuery, state: FSMContext):
@@ -99,7 +129,7 @@ async def get_inn(m: Message, state: FSMContext, bot: Bot):
     cpdf.drawString(100, 710, f"ИНН: {inn}")
     cpdf.drawString(100, 690, f"Статус: {status}")
     cpdf.drawString(100, 670, f"Время: {timestamp}")
-    cpdf.drawString(100, 650, f"Актуальные документы: {POLICY_PDF}, {CONSENT_PDF}")
+    cpdf.drawString(100, 650, f"Актуальные документы: {POLICY_PDF}, {CONSENT_PDF}, {OFFER_PDF}")
     cpdf.save()
 
     await m.answer_document(FSInputFile(pdf_name), caption="Ваше подтверждение в PDF")
@@ -131,14 +161,6 @@ async def consent_disagree_handler(c: CallbackQuery):
 
     await c.message.edit_text("Спасибо, ваш выбор зафиксирован.")
     await c.answer()
-
-@router.callback_query(F.data == "policy_pdf")
-async def send_policy(c: CallbackQuery):
-    await c.message.answer_document(FSInputFile(POLICY_PDF), caption="Политика конфиденциальности")
-
-@router.callback_query(F.data == "consent_pdf")
-async def send_consent(c: CallbackQuery):
-    await c.message.answer_document(FSInputFile(CONSENT_PDF), caption="Текст согласия")
 
 @router.message(Command("report"))
 async def report(m: Message):
